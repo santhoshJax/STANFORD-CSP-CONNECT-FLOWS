@@ -1,0 +1,375 @@
+STANFORD CSP MIGRATION
+Course Import Flow – Field Mapping Report
+==========================================
+Prepared: 2026-05-04
+
+SOURCE FILES
+------------
+  1. Course TSV        – Google Drive (configured via "Course File ID")
+  2. Instructor TSV    – Google Drive (configured via "Course Instructor File ID")
+     Columns: Course_ID, Instructor_ID, IsPrimary
+
+
+===========================================================================
+OBJECT 1: Learning
+Operation: Upsert by External_ID_4D__c
+===========================================================================
+
+Source Column          SF Field               Transformation
+---------------------------------------------------------------------
+Code                   External_ID_4D__c      stripSectionSuffix() —
+                                              removes trailing section suffix
+                                              e.g. "WSP 400-01A" → "WSP 400"
+Title                  Name                   Falls back to baseCode if empty
+Description            Description            Direct string
+(hardcoded)            Type                   Always "LearningCourse"
+(hardcoded)            IsActive               Always true
+
+
+===========================================================================
+OBJECT 2: LearningCourse
+Operation: Query by LearningId → Update if found, Create if not
+Note: Salesforce auto-creates LearningCourse when Learning is created
+      with Type="LearningCourse". Code finds and updates that record
+      rather than creating a duplicate.
+===========================================================================
+
+Source Column          SF Field               Transformation
+---------------------------------------------------------------------
+Code                   External_ID_4D__c      stripSectionSuffix(Code) → baseCode
+Code                   CourseNumber           All spaces stripped from baseCode
+                                              e.g. "WSP 400" → "WSP400"
+Title                  Name                   Falls back to baseCode if empty
+Catalog_Notes          Catalog_Notes__c       Direct string
+Catalog_Details        Catalog_Details__c     Direct string
+Units                  Units__c               parseFloat — null if 0 or empty
+Textbooks              (SKIPPED)              Field Textbooks__c not yet in org
+
+
+===========================================================================
+OBJECT 3: Location
+Operation: Query by Name → Create if not found. Cached per execution.
+===========================================================================
+
+Source Column          SF Field               Transformation
+---------------------------------------------------------------------
+Building + Room        Name                   1. Strip trailing "4DNL" token
+                                                 from Building value
+                                              2. If Room present:
+                                                 "Building - Rm Room"
+                                                 e.g. "School of Education
+                                                 (Cubberley) - Rm 334"
+                                              3. If Room empty:
+                                                 Building value alone
+
+Skip condition: Building column is empty.
+               If Building is empty but Room is populated — skipped
+               (room number alone is not meaningful).
+
+
+===========================================================================
+OBJECT 4: CourseOffering
+Operation: Upsert by External_ID_4D__c (source row id column)
+===========================================================================
+
+Source Column              SF Field                        Transformation
+-------------------------------------------------------------------------
+id                         External_ID_4D__c               Direct
+Title / Code / id          Name                            First non-empty value
+(LearningCourse lookup)    LearningCourseId                LearningCourse.Id from step 2
+Quarter                    AcademicSessionId               Quarter remapped if year < 2013:
+                                                           fa08→fa13, wi09→wi13, su10→su13
+                                                           Looked up by Abbreviation__c
+(Instructor lookup)        PrimaryFacultyId                PersonContactId (003...) resolved
+                                                           via junction file by Instructor_ID
+                                                           with "person" prefix; fallback to
+                                                           name lookup via Primary_Instructor
+(Coordinator lookup)       Coordinator__c                 Contact resolved from Coordinator_ID.
+                                                           Written directly onto CourseOffering —
+                                                           NOT a CourseOfferingParticipant record
+                                                           (see note under OBJECT 7).
+(Course_Department join)   Department__r                  Per-offering dept, direct join on
+                                                           id = Course_Department.Course_ID
+                                                           (IsPrimary row). External_ID_4D__c
+                                                           resolved against actual Account data —
+                                                           "dept_<id>" or "dept_cat_<id>",
+                                                           whichever really exists in Salesforce.
+                                                           Field omitted (not a failure) if no
+                                                           matching Account is found.
+(Location lookup)          LocationId                      NOT set on CourseOffering
+                                                           (set on CourseOfferingSchedule only)
+Enrollment_Status          Enrollment_Status__c            Normalised:
++ Cancelled                                                open → Open
+                                                           closed/closedweb → Closed
+                                                           full → Full
+                                                           cancelled → Cancelled
+                                                           If Cancelled=true → forced "Cancelled"
+Cancelled                  Cancelled__c                    parseBool
+Start_Date                 StartDate                       MM/DD/YYYY → ISO 8601
+                                                           "00/00/0000" → null
+End_Date                   EndDate                         Same date conversion
+Enrollment_Count           (SKIPPED)                       EnrolleeCount is read-only in SF
+Max_Enrollment             EnrollmentCapacity              parseIntVal — null if 0 or empty
+Max_Enrollment             MaxEnrollments__c               Same value, separate custom field
+Duration                   (SKIPPED)                       Duration_Weeks__c not yet in org
+Drop_By_Date               Drop_By_Date__c                 Date conversion
+Additional_Fee             Additional_Fee__c               parseFloat
+Instructor_Notes           Staff_Notes__c                  Merged with " | " separator
++ Staff_Notes                                              e.g. "Instructor note | Staff note"
+Other_Costs                Other_Costs__c                  parseFloat
+Other_Costs_Description    Other_Costs_Description__c      Direct string
+Web_Enrollments_Remaining  Web_Enrollments_Remaining__c    parseIntVal
+Web_Registration_Closed    Web_Registration_Closed__c      parseBool
+Exception_Text             Exception_Text__c               Direct string
+Credit_NoCredit_Required   Credit_NoCredit_Required__c     parseBool
+Do_Not_Show_On_Web         Do_Not_Show_On_Web__c           parseBool
+History                    History__c                      Direct string
+Map_Link                   Map_Link__c                     Direct string
+Other_Costs_Description_2  Other_Costs_Description_2__c    Direct string
+Other_Costs_2              Other_Costs_2__c                parseFloat
+No_Textbooks               No_Textbooks__c                 parseBool
+Roster_Email               Roster_Email__c                 Null if value is "FALSE" or "0"
+                                                           otherwise direct string
+Evaluation_Link            Evaluation_Link__c              Direct string
+Dropped_Percent            Dropped_Percent__c              parseFloat
+Dropped_Special_Percent    Dropped_Special_Percent__c      parseFloat
+Global_Eval                Global_Eval__c                  parseFloat
+Return_Rate                Return_Rate__c                  parseFloat
+No_Discounts               No_Discounts__c                 parseBool
+Canvas_Publish             Canvas_Publish__c               parseBool
+Directions_To_Class        Directions_To_Class__c          Direct string
+Additional_Info            Additional_Info__c              Direct string
+Waiter_Type                Waiver_Type__c                  Direct string
+Closed_DTS                 Closed_DTS__c                   Handles scientific notation
+                                                           (1.23E+10 → "12300000000")
+                                                           null if 0 or empty
+Room_Viewer_Link           Room_Viewer_Link__c             Direct string
+Breakeven_Enrollment       Breakeven_Enrollment__c         parseIntVal
+Enroll_On_Start_Date       Enroll_On_Start_Date__c         parseIntVal
+Evaluation_Document_ID     Evaluation_Document_ID__c       parseIntVal
+Format + Hybrid            Format__c                       If Hybrid=true → "Flex Hybrid"
+                                                           Otherwise:
+                                                           on campus     → On-campus
+                                                           online        → Online
+                                                           flex online   → Flex Online
+                                                           flex hybrid   → Flex Hybrid
+Survey_ID                  Survey_ID__c                    Direct string
+Survey_Close_Date          Survey_Close_Date__c            Date conversion
+Initial_Eval_Email_Time    Initial_Eval_Email_Time__c      Skipped if value is "0:00:00"
+Tuition_Rule_ID            Tuition_Rule_ID__c              parseIntVal — defaults to 0
+                                                           if null/empty
+Grade_Restriction          Grade_Restriction__c            Direct string
+Student_Role               Student_Role__c                 Direct string
+Course_Version             Course_Version__c               Direct string
+Catalog_Footer_Note        Catalog_Footer_Note__c          Direct string
+Recording                  Recording__c                    parseBool
+Instructor_Preferences     Textbook_Instructor_            Direct string
+                           Preferences__c
+Zoom_URL                   Zoom_URL__c                     Direct string
+Zoom_PW                    Zoom_Password__c                Direct string
+Add_Fee_Label              Add_Fee_Label__c                Direct string
+Registration_Message       Registration_Message__c         Direct string
+Additional_Description     Additional_Description__c       Direct string
+No_Wait_List               (SKIPPED)                       No_Wait_List__c not yet in org
+Do_Not_Solicit             (SKIPPED)                       Do_Not_Solicit__c not yet in org
+Program                    (SKIPPED)                       LearningProgram disabled —
+                                                           requires 2-step creation
+Reg_Open_Date              (SKIPPED)                       AcademicTerm.RegistrationOpenDate
+                                                           field not yet mapped in org
+Textbooks                  (SKIPPED)                       No target field on CourseOffering
+
+
+===========================================================================
+OBJECT 5: CourseOfferingSchedule
+Operation: Create only. Skipped if schedule already exists for CourseOffering.
+===========================================================================
+
+Source Column              SF Field               Transformation
+-------------------------------------------------------------------------
+(CourseOffering lookup)    CourseOfferingId        CourseOffering.Id from step 4
+Title / Code / id          Description             First non-empty value
+(Location lookup)          LocationId              Location.Id from step 3
+Weekday                    IsMonday                Parsed by splitting on
+                           IsTuesday               comma / slash / space /
+                           IsWednesday             ampersand, matched by prefix:
+                           IsThursday              mon, tue, wed, thu, fri, sat, sun
+                           IsFriday
+                           IsSaturday
+                           IsSunday
+Course_Time                StartTime               "9:00am" → "09:00:00"
+Course_Time                EndTime                 "12:00pm" → "12:00:00"
+
+Skip condition: Both Weekday and Course_Time are empty.
+
+
+===========================================================================
+OBJECT 6: CourseOfferingParticipant – Instructor
+Operation: Create only. Skipped if record already exists for this
+           CourseOffering + Contact + Affiliation combination.
+===========================================================================
+
+Source / Lookup            SF Field               Notes
+-------------------------------------------------------------------------
+CourseOffering.Id          CourseOfferingId
+Junction file:             ParticipantContactId   Account lookup by
+  Instructor_ID                                   External_ID_4D__c =
+                                                  "person" + Instructor_ID
+                                                  Returns PersonContactId (003...)
+                                                  Sorted: IsPrimary=true first
+(hardcoded)                ParticipantAffiliation Always "Instructor"
+Primary_Instructor         ParticipantContactId   FALLBACK only — used when
+  (fallback)                                      course has no entry in
+                                                  junction file. Name lookup.
+
+Skip condition: No instructor found in junction file and no name match.
+               One COP-Instructor record created per instructor in junction file.
+
+
+===========================================================================
+OBJECT 7: CourseOfferingParticipant – Associate
+Operation: Create only. Skipped if a record already exists for this
+           CourseOffering + Contact, matching on ANY Associate-family
+           affiliation ('Associate', 'Course Support Specialist',
+           'Guest Speaker') so a re-run doesn't duplicate under a
+           renamed value.
+===========================================================================
+
+Source / Lookup            SF Field               Notes
+-------------------------------------------------------------------------
+CourseOffering.Id          CourseOfferingId
+Junction file:             ParticipantContactId   Account lookup by
+  Associate_ID                                    External_ID_4D__c =
+  (matched via Course.RecID)                      "person" + Associate_ID
+                                                   Returns PersonContactId (003...)
+Speaking_Date               ParticipantAffiliation Derived, NOT hardcoded:
+  (junction row)                                    real date            → "Guest Speaker"
+                                                     blank / "00/00/0000" → "Course Support Specialist"
+Primary_Associate           ParticipantContactId   FALLBACK only — used when the
+  (fallback)                                       course has no entry in the
+                                                    Associate junction file.
+                                                    Numeric value → ID lookup;
+                                                    text value → name lookup
+                                                    (IsPersonAccount = true).
+(fallback rows)             ParticipantAffiliation No Speaking_Date exists on
+                                                    fallback rows, so this path
+                                                    always resolves to
+                                                    "Course Support Specialist".
+
+Skip condition: No associate found (junction file or fallback) and no name match.
+               One COP-Associate record created per associate in junction file.
+
+NOTE — Coordinator is NOT a CourseOfferingParticipant record.
+Coordinator_ID resolves to a Contact and is written directly onto
+CourseOffering.Coordinator__c (see OBJECT 4) — there is no participant
+row and no "Coordinator" ParticipantAffiliation value in the current code.
+(An earlier version of this flow did create a Coordinator participant
+record and used "Aide" for the Associate affiliation; both were replaced
+by the logic above.)
+
+
+===========================================================================
+OBJECT 8: AcademicTerm
+Status: DISABLED
+===========================================================================
+
+Source column Reg_Open_Date (target: AcademicTerm.RegistrationOpenDate)
+is not written. Field is not yet mapped in the org.
+Will be re-enabled once the field mapping is confirmed.
+
+
+===========================================================================
+OBJECT 9: Course_Department__c (junction)
+Operation: Upsert by External_ID_4D__c ("CDEPT-" + row ID). Runs as a
+           post-offering task alongside Schedule / COP-Instructor /
+           COP-Associate, once CourseOffering has been upserted.
+           Source: Course-Department TSV (configured via "Course
+           Department File ID"), columns ID, Course_ID, Department_ID,
+           IsPrimary. Only IsPrimary=True rows are written (Jul 2 decision).
+===========================================================================
+
+Source Column               SF Field                Notes
+-------------------------------------------------------------------------
+(CourseOffering lookup)     Course_Offering__r      External_ID_4D__c = Course_ID
+Department_ID                Child_Department__r    External_ID_4D__c resolved
+  (dept lookup)                                      against the actual Account —
+                                                      "dept_<id>" or "dept_cat_<id>",
+                                                      whichever really exists.
+(dept's Parent, if any)     Parent_Department__r    Set only when the resolved
+                                                      department Account itself has
+                                                      a Parent (i.e. it's a child
+                                                      dept). Left unset for
+                                                      top-level categories
+                                                      (e.g. dept_cat_4) rather than
+                                                      self-referencing Parent=Child.
+IsPrimary                   IsPrimary__c            parseBool
+
+Skip condition: Department_ID empty/"0", IsPrimary ≠ True, row ID empty
+               (no External_ID_4D__c to upsert on), or Department_ID
+               doesn't match any Account in Salesforce (logged, not fatal —
+               the CourseOffering itself is unaffected).
+
+NOTE: CourseOffering.Department__r (see OBJECT 4) is a separate,
+per-offering convenience field derived from the same source file (direct
+join on id = Course_ID) — it is NOT populated from this junction object,
+and either one succeeding/failing has no effect on the other.
+
+
+===========================================================================
+GLOBAL TRANSFORMATIONS (applied to all records)
+===========================================================================
+
+Rule                   Detail
+-----------------------------------------------------------------------
+Whitespace cleanup     All carriage returns (\r) removed.
+                       Leading/trailing spaces trimmed from every field.
+
+Null suppression       Empty or zero values are not sent to Salesforce
+                       (field simply omitted from payload).
+                       Exception: Tuition_Rule_ID__c defaults to 0.
+
+Person ID prefix       All External_ID_4D__c lookups for persons use
+                       "person" + ID  (e.g. "person424").
+                       This matches the prefix applied during Student,
+                       Instructor and Associate import flows.
+
+PersonContactId        Person lookups return PersonContactId (003...)
+                       not the Account Id (001...) — required for
+                       PrimaryFacultyId and ParticipantContactId fields.
+
+Date conversion        MM/DD/YYYY or MM/DD/YY →
+                       YYYY-MM-DDTHH:mm:ss.000Z
+                       "00/00/0000" or "00/00/00" → null
+
+Integer parse          "0" → null (field omitted).
+                       Non-numeric → null.
+
+Float parse            "0" or "0.0" → null (field omitted).
+
+Boolean parse          true / 1 / yes → true
+                       false / 0 / no → false
+                       Anything else → null (field omitted).
+
+Quarter normalisation  Quarter values with year < 13 are remapped to
+                       their 2013 equivalent:
+                       fa08 → fa13,  wi09 → wi13,  su10 → su13, etc.
+                       Applied to AcademicSession and AcademicTerm lookups.
+
+Scientific notation    Closed_DTS values in scientific notation
+                       (e.g. 1.23E+10) are converted to integer strings.
+
+
+===========================================================================
+CURRENTLY SKIPPED FIELDS (pending org configuration)
+===========================================================================
+
+Source Column          Reason
+-----------------------------------------------------------------------
+Enrollment_Count       EnrolleeCount is read-only in Salesforce
+Duration               Duration_Weeks__c field not yet added to org
+No_Wait_List           No_Wait_List__c field not yet added to org
+Do_Not_Solicit         Do_Not_Solicit__c field not yet added to org
+Textbooks              Textbooks__c field not yet added to org
+Program                LearningProgram object disabled (requires 2-step
+                       create flow — to be re-enabled)
+Reg_Open_Date          AcademicTerm.RegistrationOpenDate not yet mapped
+
