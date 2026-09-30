@@ -11,7 +11,7 @@
 import { flow, type Connection } from "@prismatic-io/spectral";
 import axios from "axios";
 import Papa from "papaparse";
-import { str, hasValue, toBool, getAccessToken, getSfInstanceUrl, runBulkJob } from "./utils";
+import { str, getAccessToken, getSfInstanceUrl, runBulkJob } from "./utils";
 import { createResultsSheet } from "./reportResults";
 
 // ── Term season mapping ────────────────────────────────────────────────────────
@@ -23,11 +23,16 @@ const TERM_FULL_NAMES: Record<string, string> = {
   sp: "Spring",
 };
 
-// ── Academic year key helper ──────────────────────────────────────────────────
-// Fall defines the academic year; Winter/Spring/Summer belong to the prior fall.
-// e.g. fa26 → "2026", wi27/sp27/su27 → "2026"
-function getAcademicYearKey(seasonCode: string, calendarYear: string): string {
-  return seasonCode === "fa" ? calendarYear : String(parseInt(calendarYear, 10) - 1);
+// ── Year helpers (architect confirmed, Sep 28) ────────────────────────────────
+// The year in a 4D quarter code is the academic year, which starts in Fall.
+// All four quarters of a code year belong to the same academic year, but
+// Winter/Spring/Summer happen in the following calendar year:
+//   fa24 → Fall 2024,   AY 2024-2025
+//   wi24 → Winter 2025, AY 2024-2025
+//   sp24 → Spring 2025, AY 2024-2025
+//   su24 → Summer 2025, AY 2024-2025
+function getCalendarYear(seasonCode: string, codeYear: string): string {
+  return seasonCode === "fa" ? codeYear : String(parseInt(codeYear, 10) + 1);
 }
 
 // ── Date helper ───────────────────────────────────────────────────────────────
@@ -152,7 +157,12 @@ export const quarterImport = flow({
     // TSV column indices (0-based):
     //   [0]  External_ID_4D__c
     //   [1]  Abbreviation__c  (e.g. "su23" — first 2 chars = season code)
-    //   [5]  IsActive
+    //   [5]  Current_Quarter — NOT used during migration. Mapping doc maps it
+    //        to IsActive (only the current quarter True), but Salesforce
+    //        rejects linking records to an inactive term, so every Term and
+    //        Session is loaded IsActive = true. Set IsActive from
+    //        Current_Quarter after all migration flows finish (pending
+    //        architect confirmation, Sep 28).
     //   [7]  Web_Launch_Date__c
     //   [8]  RegistrationOpenDate
     //   [9]  ClassStartDate
@@ -168,17 +178,16 @@ export const quarterImport = flow({
       if (!externalId) continue;
 
       const abbreviation = str(row[1]);
-      const isActive = hasValue(row[5]) ? toBool(row[5]) : false;
       const webLaunchDate = parseDate(row[7]);
       const regOpenDate = parseDate(row[8]);
       const classStartDate = parseDate(row[9]);
       const code = str(row[17]);
       const classEndDate = parseDate(row[18]);
 
-      const year = code.slice(0, 4);
+      const ayKey = code.slice(0, 4);
       const seasonCode = abbreviation.slice(0, 2).toLowerCase();
       const seasonName = TERM_FULL_NAMES[seasonCode] ?? seasonCode;
-      const ayKey = getAcademicYearKey(seasonCode, year);
+      const year = getCalendarYear(seasonCode, ayKey);
 
       // AcademicYear (deduped by academic year key)
       if (ayKey && !academicYearsMap.has(ayKey)) {
@@ -193,7 +202,7 @@ export const quarterImport = flow({
       // AcademicTerm
       const term: AcademicTermRecord = {
         Name: `${seasonName} ${year}`,
-        IsActive: isActive,
+        IsActive: true, // see [5] Current_Quarter note above
         "AcademicYear.External_ID_4D__c": ayKey,
         Season: seasonName,
         Code__c: code,
@@ -208,7 +217,7 @@ export const quarterImport = flow({
         Name: `${seasonName} ${year}`,
         "AcademicTerm.Code__c": code,
         Code__c: code,
-        IsActive: isActive,
+        IsActive: true,
         External_ID_4D__c: externalId,
         Season: seasonName,
         Abbreviation__c: abbreviation,

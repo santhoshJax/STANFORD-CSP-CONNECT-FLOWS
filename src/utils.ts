@@ -9,7 +9,14 @@ import type { Connection } from "@prismatic-io/spectral";
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 export const POLL_INTERVAL_MS = 2_000;
-export const SF_API_VERSION = "v60.0";
+// Bumped from v60.0 (Sep 25): Bulk API 2.0 jobs pinned to v60.0 rejected
+// CourseOfferingParticipant.RegistrationDateTime with "Field name not found",
+// even though the field exists, is fully permissioned, and inserts fine via
+// Workbench (confirmed at API 68.0) and Salesforce Inspector. Some standard
+// fields aren't exposed to Bulk API's schema validation until a later API
+// version — this is a version-visibility issue, not a field/permission one.
+// Matches the version confirmed working via Workbench's manual test.
+export const SF_API_VERSION = "v68.0";
 
 // ── Lookup maps ────────────────────────────────────────────────────────────────
 

@@ -6,38 +6,72 @@
  * CourseOfferingParticipant records via Bulk API 2.0. Once every COP batch
  * has fully completed, a second phase creates one CourseOfferingPtcpResult
  * child record for each COP with a populated Grade (LetterGrade = Grade__c,
- * ParticipantResultStatus = "Final") — reusing the same in-memory deduped
- * rows, no second file read. Must run after COP, since a Result's lookup to
- * its parent COP requires that COP to already exist in Salesforce.
+ * ParticipantResultStatus = see mapParticipantResultStatus()) — reusing the
+ * same in-memory deduped rows, no second file read. Must run after COP,
+ * since a Result's lookup to its parent COP requires that COP to already
+ * exist in Salesforce.
+ *
+ * ParticipantResultStatus: the mapping doc said to always send "Final", but
+ * that field's real picklist only has Pass/Fail/Incomplete/Withdraw (locked
+ * by the standard package — "Final" can't be added). Architect confirmed
+ * (Sep 28) the Grade → status mapping: A+/A/A-/B+/B/B-/C+/C/C-/CR/NGR →
+ * Pass; D+/D/D-/NC/NP → Fail. Any other grade value has no confirmed
+ * mapping yet and is skipped (logged, not guessed).
  *
  * PREREQUISITES (must run before this flow):
  *   1. Student flow       — loads Person Account / Contact (Student_ID_4D__c)
  *   2. Course flow        — loads CourseOffering (External_ID_4D__c)
- *   3. Registration flow  — loads AcademicTermEnrollment (External_ID_4D__c)
+ *   3. Registration flow  — NOTE: does NOT load AcademicTermEnrollment (it
+ *      only creates CardPaymentMethod/Order/PaymentGroup/Payment — see
+ *      AcademicTermEnrollmentId note below). Still a prerequisite in case
+ *      that changes.
+ *
+ * AcademicTermEnrollmentId is NOT SET on COP (see mapToEnrollmentCop).
+ * Architect (Sep 28): AcademicTermEnrollment is not populated for
+ * registrations going forward, so past data should not populate it either —
+ * doing so could cause issues with the build. No flow creates it.
  *
  * External ID: "ENR-{Enrollment.ID}"  e.g. "ENR-200058"
  *   Prefixed to avoid collision with CINST-{n} / CASSOC-{n} instructor/associate COPs.
  *   Enrollment Waiver flow must look up COPs using this same "ENR-" prefix.
  *
- * DEDUP RULE (Jul 2 refinement):
+ * DEDUP RULE (Jul 2 refinement; Status handling updated per architect, Sep 18):
  *   When a student drops, 4D creates 2–3 enrollment rows for the same
- *   Registration_ID + Student_ID + Course_ID. Only one COP is created in SF.
- *   Terminal-status precedence (highest rank wins):
- *     Drop w/ Refund variants (10) > Drop No Refund (9) > Drop - Pending (8)
- *     > Drop Transferred (7) > Cancel variants (6) > Drop (5) > UnEnrolled (4)
- *     > Adjustment (3) > DupEnrollment (2) > Enrolled / Wait List (1)
+ *   Registration_ID + Student_ID + Course_ID. Only one COP is created in SF
+ *   for that group. Terminal-status precedence (highest rank wins):
+ *     Drop variants (10–7) > Cancel variants (6) > Drop (5) > UnEnrolled (4)
+ *     > DupEnrollment (2) > Enrolled / Wait List (1)
  *     > New (0 — excluded entirely per Amy Jul 2: abandoned cart)
+ *   EXCEPTION — Adjustment: per architect (Sep 18), "Adjustment" rows are
+ *   NEVER folded into this group ranking. 4D creates a separate Adjustment
+ *   row alongside the primary Enrolled/Dropped row when staff process a late
+ *   refund/tuition change, and both must produce their own COP in Salesforce
+ *   ("bring in both records"). See buildDedupMap().
  *
- * OPEN ITEMS (async follow-up required — affected records excluded until resolved):
- *   - "Adjustment" (6,456):         Late refund/tuition adjustment. Target status TBD (Amy).
- *   - "DupEnrollment" (3,173):      Exclude or migrate as "Enrolled"? TBD.
- *   - "Course cancel" (4,859):      Course-cancelled vs. student-dropped. Status TBD (Amy).
- *   - "Cancelled - Refunded" (3,430): Status TBD.
- *   - "Cancelled - Pending" (18):   Status TBD.
- *   - Legacy_Enrollment_Status__c:  Where to preserve drop/refund detail (Holly/Amy async).
- *   - TA_Discount sign convention:  Stored as negative per SA recommendation; confirm with Ahmet.
- *   - Audit fields (CreatedDate, LastModifiedDate): Requires "Set Audit Fields upon Record
- *     Creation" and "Create Audit Fields" permissions for the migration user.
+ * STATUS → ParticipationStatus (all resolved as of Sep 18 architect update):
+ *   - Enrolled → "Enrolled"; Wait List → "Waitlisted"; UnEnrolled → "Dropped"
+ *   - All Drop variants (Drop w/Refund, Drop No Refund, Drop Transferred,
+ *     Drop - Pending, Drop, and 1-record junk variants) → "Dropped" (flattened
+ *     — supersedes the earlier plan to preserve refund detail as separate
+ *     picklist values; architect, Sep 18: "All dropped statuses will need to
+ *     be set as 'Dropped'")
+ *   - Course cancel, Cancelled - Refunded, Cancelled - Pending → "Cancelled"
+ *     (architect, Sep 18 — confirmed "Course cancel" is included)
+ *   - Adjustment → "Adjustment" (new status; architect, Sep 18)
+ *   - DupEnrollment → "DupEnrollment" (new status; architect confirmed: keep
+ *     these records as-is, do not exclude or remap to "Enrolled")
+ *   - New → excluded entirely (abandoned cart, Amy Jul 2); blank/unknown → null
+ *   ⚠ PREREQUISITE: Salesforce's ParticipationStatus picklist must have
+ *   "Cancelled", "Adjustment", and "DupEnrollment" added as values before
+ *   this flow runs — only "Enrolled", "Waitlisted", "Dropped", "Completed"
+ *   exist today. Records will fail to upsert until these are added.
+ *
+ * OPEN ITEMS:
+ *   - TA_Discount sign convention: RESOLVED — approved to store as negative
+ *     (matches source format).
+ *   - Audit fields (CreatedDate, LastModifiedDate): Requires "Set Audit Fields
+ *     upon Record Creation" and "Create Audit Fields" permissions for the
+ *     migration user — in progress (self-service, Salesforce admin task).
  */
 
 import { flow, type Connection } from "@prismatic-io/spectral";
@@ -48,7 +82,13 @@ import { createPerObjectResultsSheet } from "./reportResults";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const SF_API = "v60.0";
-const BULK_BATCH_SIZE = 50_000;
+// Smaller than the 50,000 used elsewhere in this project (Registration,
+// Transcript Request, Textbook) — deliberately, as extra safety margin after
+// this flow hit the 1GB memory limit twice building/uploading a 50K-record
+// CSV batch on top of everything else already in memory at that point.
+// Sequential batches cost nothing extra either way (each is awaited before
+// the next starts), so a smaller size only adds a couple more round-trips.
+const BULK_BATCH_SIZE = 20_000;
 const SF_OBJECT = "CourseOfferingParticipant";
 const EXT_ID_FIELD = "External_ID_4D__c";
 const TEST_MODE = false;  // set to false to process all records
@@ -86,46 +126,79 @@ const VALID_COURSE_ID_PREFIXES = buildValidCourseIdPrefixes(
 
 // ── Raw row type ──────────────────────────────────────────────────────────────
 
+// NOTE: intentionally holds ONLY the columns actually read anywhere in this
+// file (Program, Source, Other_Costs, Created_By, Last_Modified_By,
+// Grade_Printed_Date, Student_ID_Previous, Prior_Enrollment_ID,
+// STAP_Report_Run_Date's sibling No_Discounts, and Instructor_ID are all
+// "Do Not Map" and dropped). This is deliberate, not an oversight: with
+// ~500K rows surviving dedup and held in memory simultaneously, every extra
+// column here is ~500K extra string properties — see NEEDED_COLUMNS /
+// buildDedupMap() below, which was hitting Prismatic's 1GB execution memory
+// limit before this trim (and before switching off dynamic/dictionary-mode
+// object construction).
 interface RawEnrollmentRow {
   ID?: string;
   Registration_ID?: string;
   Student_ID?: string;
   Course_ID?: string;
-  Program?: string;             // Do Not Map
   Grade_Option?: string;
   Grade?: string;
   Grade_Entered_Date?: string;
   Status?: string;
-  Source?: string;              // Do Not Map
   Notes?: string;
   Tuition?: string;
   Fee?: string;
-  Other_Costs?: string;         // Do Not Map
   Add_Drop?: string;
   Extension?: string;
   TA_Discount?: string;
   Created_Date?: string;
   Created_Time?: string;        // merged into CreatedDate
-  Created_By?: string;          // Do Not Map
   Last_Modified_Date?: string;
   Last_Modified_Time?: string;  // merged into LastModifiedDate
-  Last_Modified_By?: string;    // Do Not Map
   STAP_Applied?: string;
   Enrollment_Date?: string;
-  Grade_Printed_Date?: string;  // Do Not Map
-  Student_ID_Previous?: string; // Do Not Map
-  Prior_Enrollment_ID?: string; // Do Not Map
   STAP_Report_Run_Date?: string;
-  No_Discounts?: string;        // Do Not Map
   Survey_Response_Date?: string;
   Survey_Response_Time?: string;
-  Instructor_ID?: string;       // Do Not Map
-  [key: string]: string | undefined;
 }
+
+// Column names pulled out of each raw TSV row — must match RawEnrollmentRow's
+// keys above exactly. Building each row via this fixed list (instead of
+// looping over every TSV header, as before) also lets V8 use one consistent,
+// memory-efficient object shape for all ~586K rows instead of a slower,
+// heavier "dictionary mode" object per row.
+const NEEDED_COLUMNS: (keyof RawEnrollmentRow)[] = [
+  "ID",
+  "Registration_ID",
+  "Student_ID",
+  "Course_ID",
+  "Grade_Option",
+  "Grade",
+  "Grade_Entered_Date",
+  "Status",
+  "Notes",
+  "Tuition",
+  "Fee",
+  "Add_Drop",
+  "Extension",
+  "TA_Discount",
+  "Created_Date",
+  "Created_Time",
+  "Last_Modified_Date",
+  "Last_Modified_Time",
+  "STAP_Applied",
+  "Enrollment_Date",
+  "STAP_Report_Run_Date",
+  "Survey_Response_Date",
+  "Survey_Response_Time",
+];
 
 // ── Dedup helpers ─────────────────────────────────────────────────────────────
 
 // Higher rank = more terminal status = wins when multiple rows share a dedup group.
+// NOTE: "Adjustment" is NOT ranked here — those rows bypass grouping entirely
+// and are always kept as their own separate COP (architect, Sep 18: "bring in
+// both records"). See buildDedupMap().
 function statusRank(status: string): number {
   const s = status.trim();
   if (
@@ -139,7 +212,7 @@ function statusRank(status: string): number {
   if (s === "Drop no refund" || s === "Drop No Refund") return 9;
   if (s === "Drop - Pending") return 8;
   if (s === "Drop Transferred") return 7;
-  // Cancel variants — OPEN; ranked so they can win a group but are excluded in the mapper
+  // Cancel variants — all map to ParticipationStatus "Cancelled" (architect, Sep 18)
   if (
     s === "Course cancel" ||
     s === "Cancelled - Refunded" ||
@@ -148,11 +221,11 @@ function statusRank(status: string): number {
     return 6;
   if (s === "Drop") return 5;
   if (s === "UnEnrolled") return 4;
-  // OPEN items — ranked but excluded in mapper until business decision
-  if (s === "Adjustment") return 3;
+  // DupEnrollment kept as its own status per architect — participates in
+  // normal dedup ranking like any other status.
   if (s === "DupEnrollment") return 2;
   if (s === "Enrolled" || s === "Wait List") return 1;
-  return 0; // "New" (abandoned cart), blank, unknown — always excluded
+  return 0; // "New" (abandoned cart, excluded earlier), blank, unknown
 }
 
 // ── Value mapping helpers ─────────────────────────────────────────────────────
@@ -162,19 +235,38 @@ function mapParticipationStatus(raw: string | undefined): string | null {
   if (s === "Enrolled") return "Enrolled";
   if (s === "Wait List") return "Waitlisted";
   if (s === "UnEnrolled") return "Dropped";
+  // All Drop variants flatten to plain "Dropped" — architect, Sep 18: "All
+  // dropped statuses will need to be set as 'Dropped'" (supersedes the
+  // earlier plan to preserve refund detail as separate picklist values).
   if (
     s === "Drop w/Refund" ||
     s === "Drop w/ refund" ||
     s === "Drop w/refund" ||
     s === "Drop 1/2 refund" ||
-    s === "Drop w/ r"
+    s === "Drop w/ r" ||
+    s === "Drop no refund" ||
+    s === "Drop No Refund" ||
+    s === "Drop Transferred" ||
+    s === "Drop - Pending" ||
+    s === "Drop"
   )
-    return "Drop w/ Refund";
-  if (s === "Drop no refund" || s === "Drop No Refund") return "Drop No Refund";
-  if (s === "Drop Transferred") return "Drop Transferred";
-  if (s === "Drop - Pending") return "Drop - Pending";
-  if (s === "Drop") return "Dropped";
-  return null; // OPEN or unknown — caller logs and skips
+    return "Dropped";
+  // Cancel variants — architect, Sep 18: "All statuses with Cancelled in
+  // them will need to be set as 'Cancelled'" (confirmed "Course cancel" is
+  // included even though it doesn't literally contain the word "Cancelled").
+  if (
+    s === "Course cancel" ||
+    s === "Cancelled - Refunded" ||
+    s === "Cancelled - Pending"
+  )
+    return "Cancelled";
+  // Architect, Sep 18: Adjustment becomes its own status and is never
+  // excluded. The matching Enrolled/Dropped row from the same dedup group is
+  // kept too — see buildDedupMap() for how both rows survive as separate COPs.
+  if (s === "Adjustment") return "Adjustment";
+  // Architect confirmed: keep DupEnrollment records as-is, as their own status.
+  if (s === "DupEnrollment") return "DupEnrollment";
+  return null; // blank or unrecognized — caller logs and skips
 }
 
 function mapGradeOption(raw: string | undefined): string | undefined {
@@ -226,6 +318,37 @@ function normalizeGrade(raw: string | undefined): string | undefined {
       return "S";
     default:
       return s;
+  }
+}
+
+// Grade → ParticipantResultStatus (CourseOfferingPtcpResult). Architect
+// confirmed (Sep 28) — the field's real picklist only has Pass/Fail/
+// Incomplete/Withdraw, not "Final" as the mapping doc originally said, and
+// that value can't be added (locked by the standard package). Only the
+// values actually present in our real 2-year data were confirmed; anything
+// else returns undefined (record skipped) rather than guessing.
+function mapParticipantResultStatus(grade: string): string | undefined {
+  switch (grade) {
+    case "A+":
+    case "A":
+    case "A-":
+    case "B+":
+    case "B":
+    case "B-":
+    case "C+":
+    case "C":
+    case "C-":
+    case "CR":
+    case "NGR":
+      return "Pass";
+    case "D+":
+    case "D":
+    case "D-":
+    case "NC":
+    case "NP":
+      return "Fail";
+    default:
+      return undefined;
   }
 }
 
@@ -355,14 +478,6 @@ async function buildCourseOfferingCache(
 // (Registration_ID + Student_ID + Course_ID) keeps only the row with the
 // highest status rank (most terminal). Memory cost = O(unique_groups × row_size).
 
-const OPEN_STATUSES = new Set([
-  "Adjustment",
-  "DupEnrollment",
-  "Course cancel",
-  "Cancelled - Refunded",
-  "Cancelled - Pending",
-]);
-
 async function buildDedupMap(
   fileId: string,
   accessToken: string,
@@ -370,7 +485,8 @@ async function buildDedupMap(
   winners: Map<string, RawEnrollmentRow>;
   totalRows: number;
   excludedNew: number;
-  openStatusCounts: Map<string, number>;
+  adjustmentCount: number;
+  skippedOutOfWindow: number;
 }> {
   const response = await axios.get(
     `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`,
@@ -384,10 +500,28 @@ async function buildDedupMap(
   return new Promise((resolve, reject) => {
     const winners = new Map<string, RawEnrollmentRow>();
     const winnerRank = new Map<string, number>();
-    const openStatusCounts = new Map<string, number>();
-    let headers: string[] = [];
+    // Maps each NEEDED_COLUMNS name to its column index in the raw TSV, built
+    // once the header row is seen. Columns we don't care about (Program,
+    // Source, Created_By, etc.) simply never get an entry here and are never
+    // read — see the RawEnrollmentRow comment above for why that matters.
+    const columnIndex: Partial<Record<keyof RawEnrollmentRow, number>> = {};
+    let headersSeen = false;
     let totalRows = 0;
     let excludedNew = 0;
+    let adjustmentCount = 0;
+    let skippedOutOfWindow = 0;
+    let settled = false;
+    const finish = (result: {
+      winners: Map<string, RawEnrollmentRow>;
+      totalRows: number;
+      excludedNew: number;
+      adjustmentCount: number;
+      skippedOutOfWindow: number;
+    }) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
 
     papaParse(response.data as unknown as NodeJS.ReadableStream, {
       delimiter: "\t",
@@ -395,29 +529,81 @@ async function buildDedupMap(
       header: false,
       skipEmptyLines: true,
 
-      step: (result: Papa.ParseResult<string[]>) => {
+      step: (
+        result: Papa.ParseResult<string[]>,
+        parser: { abort: () => void },
+      ) => {
         const raw = result.data as unknown as string[];
 
-        if (headers.length === 0) {
-          headers = raw.map(
-            (h, i) =>
-              h
-                .replace(/^﻿/, "")
-                .replace(/\r/g, "")
-                .trim() || `__blank_${i}`,
+        if (!headersSeen) {
+          headersSeen = true;
+          const headers = raw.map((h) =>
+            h
+              .replace(/^﻿/, "")
+              .replace(/\r/g, "")
+              .trim(),
           );
+          for (const col of NEEDED_COLUMNS) {
+            const idx = headers.indexOf(col);
+            if (idx !== -1) columnIndex[col] = idx;
+          }
           return;
         }
 
-        const record: RawEnrollmentRow = {};
-        headers.forEach((h, i) => {
-          if (!h.startsWith("__blank_")) {
-            record[h] = (raw[i] ?? "").replace(/\r/g, "");
-          }
-        });
+        const get = (col: keyof RawEnrollmentRow): string => {
+          const idx = columnIndex[col];
+          return idx === undefined ? "" : (raw[idx] ?? "").replace(/\r/g, "");
+        };
+        // Fixed property list on every object — same shape every time, so V8
+        // can use one fast hidden class across all ~586K rows instead of
+        // dictionary mode (see RawEnrollmentRow comment above).
+        const record: RawEnrollmentRow = {
+          ID: get("ID"),
+          Registration_ID: get("Registration_ID"),
+          Student_ID: get("Student_ID"),
+          Course_ID: get("Course_ID"),
+          Grade_Option: get("Grade_Option"),
+          Grade: get("Grade"),
+          Grade_Entered_Date: get("Grade_Entered_Date"),
+          Status: get("Status"),
+          Notes: get("Notes"),
+          Tuition: get("Tuition"),
+          Fee: get("Fee"),
+          Add_Drop: get("Add_Drop"),
+          Extension: get("Extension"),
+          TA_Discount: get("TA_Discount"),
+          Created_Date: get("Created_Date"),
+          Created_Time: get("Created_Time"),
+          Last_Modified_Date: get("Last_Modified_Date"),
+          Last_Modified_Time: get("Last_Modified_Time"),
+          STAP_Applied: get("STAP_Applied"),
+          Enrollment_Date: get("Enrollment_Date"),
+          STAP_Report_Run_Date: get("STAP_Report_Run_Date"),
+          Survey_Response_Date: get("Survey_Response_Date"),
+          Survey_Response_Time: get("Survey_Response_Time"),
+        };
 
         if (!str(record.ID).trim()) return;
         totalRows++;
+
+        // TEST_MODE: stop reading the file early instead of streaming and
+        // deduping the full ~586K-row file, so a small test run doesn't risk
+        // the same out-of-memory failure a full run would need more headroom
+        // for. (TEST_LIMIT further down only trims the FINAL record list —
+        // it can't help here, since by then the whole file has already been
+        // read.) Not a substitute for fixing full-run memory — just enough
+        // to safely test the new Status logic end-to-end.
+        if (TEST_MODE && totalRows >= TEST_LIMIT) {
+          parser.abort();
+          finish({
+            winners,
+            totalRows,
+            excludedNew,
+            adjustmentCount,
+            skippedOutOfWindow,
+          });
+          return;
+        }
 
         const status = str(record.Status).trim();
 
@@ -426,17 +612,36 @@ async function buildDedupMap(
           return;
         }
 
-        if (OPEN_STATUSES.has(status)) {
-          openStatusCounts.set(
-            status,
-            (openStatusCounts.get(status) ?? 0) + 1,
-          );
+        // Course Flow only migrates CourseOffering records within the
+        // current 2-year window — an enrollment for a course outside it has
+        // no CourseOffering to link to, so it can never become a COP.
+        // Filtering here, DURING the streaming pass (not after dedup), keeps
+        // peak memory bounded: on the real file, ~530K/586K rows are outside
+        // this window, and letting all of them sit in the dedup map first —
+        // only to discard 91% of them a moment later — is what pushed a full
+        // run over Prismatic's 1GB memory limit.
+        const courseId = str(record.Course_ID).trim();
+        const coursePrefix = courseId.split("_")[0];
+        if (!coursePrefix || !VALID_COURSE_ID_PREFIXES.has(coursePrefix)) {
+          skippedOutOfWindow++;
+          return;
+        }
+
+        // Architect, Sep 18: "bring in both records" for Adjustment — 4D
+        // creates a separate Adjustment row alongside the primary
+        // Enrolled/Dropped row for the same Registration_ID + Student_ID +
+        // Course_ID group. Adjustment rows bypass the group-ranking below
+        // entirely (keyed on their own unique Enrollment ID) so they always
+        // survive as their own COP, regardless of what wins the group.
+        if (status === "Adjustment") {
+          adjustmentCount++;
+          winners.set(`adj:${str(record.ID).trim()}`, record);
+          return;
         }
 
         const rank = statusRank(status);
         const regId = stripDotZero(record.Registration_ID);
         const studId = stripDotZero(record.Student_ID);
-        const courseId = str(record.Course_ID).trim();
         const groupKey = `${regId}|${studId}|${courseId}`;
 
         const existingRank = winnerRank.get(groupKey) ?? -1;
@@ -447,8 +652,16 @@ async function buildDedupMap(
       },
 
       complete: () =>
-        resolve({ winners, totalRows, excludedNew, openStatusCounts }),
-      error: (err: Error) => reject(err),
+        finish({
+          winners,
+          totalRows,
+          excludedNew,
+          adjustmentCount,
+          skippedOutOfWindow,
+        }),
+      error: (err: Error) => {
+        if (!settled) reject(err);
+      },
     });
   });
 }
@@ -468,8 +681,6 @@ function mapToEnrollmentCop(
 
   const status = str(raw.Status).trim();
 
-  if (OPEN_STATUSES.has(status)) return null; // excluded pending decisions
-
   const participationStatus = mapParticipationStatus(status);
   if (!participationStatus) {
     logger.warn(
@@ -484,12 +695,15 @@ function mapToEnrollmentCop(
     ParticipationStatus: participationStatus,
   };
 
-  // AcademicTermEnrollment — resolved by Salesforce during Bulk API job
-  // via the external ID relationship reference in the CSV column header.
-  const regId = stripDotZero(raw.Registration_ID);
-  if (regId && regId !== "0") {
-    record["AcademicTermEnrollment.External_ID_4D__c"] = regId;
-  }
+  // AcademicTermEnrollment — intentionally not set. Architect (Sep 28): it is
+  // not populated for registrations going forward, so migrated data leaves it
+  // blank too (populating past data could cause issues with the build). No
+  // AcademicTermEnrollment records exist in Salesforce, so sending this lookup
+  // would fail every row (INVALID_FIELD: foreign key external ID not found).
+  // const regId = stripDotZero(raw.Registration_ID);
+  // if (regId && regId !== "0") {
+  //   record["AcademicTermEnrollment.External_ID_4D__c"] = regId;
+  // }
 
   // Student contact + account
   const studentId = stripDotZero(raw.Student_ID);
@@ -526,9 +740,16 @@ function mapToEnrollmentCop(
   const grade = normalizeGrade(raw.Grade);
   if (grade) record.Grade__c = grade;
 
-  // Grade_Entered_Date
+  // Grade_Entered_Date — mapping doc says "Grade_Entered_Date__c", but the
+  // real field in the org is named "IP_GradeEnteredDate__c" (confirmed via
+  // live Object Manager, Sep 25 — job-level "Field name not found" error on
+  // the documented name). It's also a DateTime field, not Date — confirmed
+  // Sep 28 by "not a valid value for the type xsd:dateTime" when sending a
+  // plain date — so a default time-of-day is appended, same pattern as
+  // Enrollment_Date__c/RegistrationDateTime below.
   const gradeEnteredDate = enrollDate(raw.Grade_Entered_Date);
-  if (gradeEnteredDate) record.Grade_Entered_Date__c = gradeEnteredDate;
+  if (gradeEnteredDate)
+    record.IP_GradeEnteredDate__c = `${gradeEnteredDate}T00:00:00.000Z`;
 
   // Notes → Summary (strip _4DNL_ tokens)
   const notes = str(raw.Notes).replace(/_4DNL_/g, "\n").trim();
@@ -644,43 +865,31 @@ export const enrollmentImport = flow({
     logger.info(
       "[Enrollment Import] Streaming Enrollment TSV and building dedup map…",
     );
-    const { winners, totalRows, excludedNew, openStatusCounts } =
-      await buildDedupMap(fileId, gdToken);
+    const {
+      winners,
+      totalRows,
+      excludedNew,
+      adjustmentCount,
+      skippedOutOfWindow,
+    } = await buildDedupMap(fileId, gdToken);
 
+    const uniqueGroups = winners.size;
     logger.info(
       `[Enrollment Import] Dedup complete — total=${totalRows}, ` +
-        `uniqueGroups=${winners.size}, excludedNew=${excludedNew}`,
+        `uniqueGroups=${uniqueGroups}, excludedNew=${excludedNew}, ` +
+        `adjustmentRecordsKeptSeparately=${adjustmentCount}, ` +
+        `skippedOutOfWindow=${skippedOutOfWindow}`,
     );
 
-    if (openStatusCounts.size > 0) {
-      const detail = [...openStatusCounts.entries()]
-        .map(([s, n]) => `"${s}" ×${n}`)
-        .join(", ");
-      logger.warn(
-        `[Enrollment Import] OPEN STATUS VALUES excluded pending mapping decisions: ${detail}. ` +
-          "See flow header for resolution options.",
-      );
-    }
-
     // ── Map to SF records ─────────────────────────────────────────────────────
+    // The 2-year window filter already ran DURING buildDedupMap's streaming
+    // pass above (not here) — that's what keeps peak memory bounded, since it
+    // stops ~530K/586K out-of-scope rows from ever entering the dedup map in
+    // the first place. `winners` at this point only holds in-window rows.
     const sfRecords: EnrollmentCopRecord[] = [];
-    let skippedOpenStatus = 0;
-    let skippedOutOfWindow = 0;
     let skippedUnmappable = 0;
 
     for (const row of winners.values()) {
-      if (OPEN_STATUSES.has(str(row.Status).trim())) {
-        skippedOpenStatus++;
-        continue;
-      }
-      // Course Flow only migrates CourseOffering records within the current
-      // 2-year window — an enrollment for a course outside it has nothing to
-      // link to and would just fail on a missing required CourseOfferingId.
-      const coursePrefix = str(row.Course_ID).trim().split("_")[0];
-      if (!coursePrefix || !VALID_COURSE_ID_PREFIXES.has(coursePrefix)) {
-        skippedOutOfWindow++;
-        continue;
-      }
       const mapped = mapToEnrollmentCop(row, studentCache, coCache, logger);
       if (!mapped) {
         skippedUnmappable++;
@@ -688,6 +897,9 @@ export const enrollmentImport = flow({
       }
       sfRecords.push(mapped);
     }
+    // Done with the raw rows — drop the reference so V8 can reclaim this
+    // memory before the (also memory-hungry) Bulk API upload below runs.
+    winners.clear();
 
     if (TEST_MODE && sfRecords.length > TEST_LIMIT) {
       sfRecords.splice(TEST_LIMIT);
@@ -698,13 +910,13 @@ export const enrollmentImport = flow({
 
     logger.info(
       `[Enrollment Import] ${sfRecords.length} records ready to upsert ` +
-        `(skipped ${skippedOpenStatus} open-status, ${skippedOutOfWindow} outside 2yr window, ${skippedUnmappable} unmappable)`,
+        `(${skippedUnmappable} unmappable)`,
     );
 
     if (sfRecords.length === 0) {
       logger.info("[Enrollment Import] No records to upsert — done.");
       return {
-        data: { totalRows, uniqueGroups: winners.size, sfRecords: 0 },
+        data: { totalRows, uniqueGroups, sfRecords: 0 },
       };
     }
 
@@ -756,16 +968,36 @@ export const enrollmentImport = flow({
     // object, and it's a clean 1:1 relationship: at most one Result per COP).
     const RESULT_OBJECT = "CourseOfferingPtcpResult";
     const resultRecords: Record<string, unknown>[] = [];
+    let skippedUnmappableResultStatus = 0;
     for (const rec of sfRecords) {
       const grade = rec.Grade__c as string | undefined;
       if (!grade) continue;
+      const resultStatus = mapParticipantResultStatus(grade);
+      if (!resultStatus) {
+        skippedUnmappableResultStatus++;
+        logger.warn(
+          `[Enrollment Import][Result] Grade "${grade}" has no ParticipantResultStatus mapping — Result skipped for ${rec.External_ID_4D__c}`,
+        );
+        continue;
+      }
       const copExtId = rec.External_ID_4D__c as string;
+      // LetterGrade (standard field) is capped at 2 characters — architect
+      // confirmed (Sep 29): shrink "NGR" to "NG" rather than leave it blank
+      // or resize the field (which isn't possible; it's a standard field).
+      // Grade__c on COP keeps the full "NGR" value untouched — only this
+      // Result field is shortened.
+      const letterGrade = grade === "NGR" ? "NG" : grade;
       resultRecords.push({
         External_ID_4D__c: copExtId,
         "CourseOfferingParticipant.External_ID_4D__c": copExtId,
-        LetterGrade: grade,
-        ParticipantResultStatus: "Final",
+        LetterGrade: letterGrade,
+        ParticipantResultStatus: resultStatus,
       });
+    }
+    if (skippedUnmappableResultStatus > 0) {
+      logger.warn(
+        `[Enrollment Import][Result] ${skippedUnmappableResultStatus} graded record(s) skipped — grade value not yet mapped to a ParticipantResultStatus.`,
+      );
     }
 
     logger.info(
@@ -842,9 +1074,10 @@ export const enrollmentImport = flow({
       `[Enrollment Import] Complete —` +
         `\n  Source rows:      ${totalRows}` +
         `\n  Excluded (New):   ${excludedNew}` +
-        `\n  Dedup groups:     ${winners.size}` +
-        `\n  Open-status:      ${skippedOpenStatus}` +
+        `\n  Dedup groups:     ${uniqueGroups}` +
+        `\n  Adjustment (kept separately): ${adjustmentCount}` +
         `\n  Outside 2yr window: ${skippedOutOfWindow}` +
+        `\n  Unmappable status: ${skippedUnmappable}` +
         `\n  COP submitted:    ${sfRecords.length}` +
         `\n  COP processed:    ${totalProcessed}` +
         `\n  COP failed:       ${totalFailed}` +
@@ -856,8 +1089,10 @@ export const enrollmentImport = flow({
     return {
       data: {
         totalRows,
-        uniqueGroups: winners.size,
+        uniqueGroups,
+        adjustmentCount,
         skippedOutOfWindow,
+        skippedUnmappable,
         sfRecords: sfRecords.length,
         processed: totalProcessed,
         failed: totalFailed,

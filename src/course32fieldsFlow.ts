@@ -1,12 +1,28 @@
 /**
- * Stanford CSP Migration – Course 32-Field Import flow.
+ * Stanford CSP Migration – Course 32-Field Import flow (Tier 2).
  *
- * Streams the course TSV from Google Drive, filters to rows modified within
- * the last 5 years (Last_Modified_Date), and maps only 32 specified fields.
+ * Same processing as the Course Import flow (courseFlow.ts), but maps only the
+ * 32 Tier 2 course fields and covers the three academic years before Tier 1.
  *
- * Processing order per row:
+ * Course data tiers (Julia / architect, Sep 2026):
+ *   Tier 1 – all fields      – AY 2024-25, 2025-26 (courseFlow.ts)
+ *   Tier 2 – 32 fields       – AY 2021-22, 2022-23, 2023-24 (this flow)
+ *   Tier 3 – minimal fields  – AY 2020-21 and older (not built yet)
+ * The number in a 4D quarter code is the academic year (starts in Fall), so
+ * Tier 2 = fa/wi/sp/su 21, 22, 23.
+ *
+ * Each row triggers sequential Salesforce REST API calls in dependency order:
  *   Learning → LearningCourse → Instructor → CourseOffering
  *   → CourseOfferingSchedule → COP (Instructor / Associate)
+ *
+ * Not written by this flow (fields outside the 32): Location, department
+ * (Learning.ProviderId, CourseOffering.Department__r, Course_Department__c),
+ * Course_Submission fields, Textbooks, Enrollment_Status (derived from
+ * Cancelled only).
+ *
+ * Learning / LearningCourse are shared with Tier 1 by base course code. If one
+ * already exists in Salesforce it is left untouched, so an older Tier 2 title
+ * or description never overwrites the newer Tier 1 catalog data.
  *
  * Recurses via context.invokeFlow until the full file is processed.
  */
@@ -18,6 +34,7 @@ import { str, getAccessToken, getSfInstanceUrl } from "./utils";
 import { createPerObjectResultsSheet } from "./reportResults";
 import {
   parseCourseDate,
+  parseDurationSplit,
   normaliseEnrollmentStatus,
   normaliseCatalogNotes,
   parseBool,
@@ -32,26 +49,40 @@ import {
 } from "./courseUtils";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-
 const MAX_ROWS = 100;
-const TEST_MODE = false;
+const TEST_MODE = false; // set false to process all rows
 const TEST_MAX_ROWS = 100;
 const SF_API = "v60.0";
-const YEARS_BACK = 5;
+
+// ── Quarter filter ────────────────────────────────────────────────────────────
+// Tier 2 = the 3 academic years before Tier 1 (courseFlow: wi25, 2 years → 24–25).
+// ANCHOR_QUARTER="wi23", YEARS_BACK=3 → fa/wi/sp/su 21, 22, 23
+const ANCHOR_QUARTER = "wi23";
+const YEARS_BACK = 3;
+
+function buildValidQuarters(anchor: string, yearsBack: number): Set<string> {
+  const seasons = ["wi", "sp", "su", "fa"];
+  const m = /^([a-z]+)(\d+)$/.exec(anchor.toLowerCase());
+  if (!m) throw new Error(`Invalid ANCHOR_QUARTER: "${anchor}"`);
+  const anchorYear = parseInt(m[2], 10);
+  const set = new Set<string>();
+  for (let y = anchorYear - yearsBack + 1; y <= anchorYear; y++) {
+    const yStr = String(y).slice(-2).padStart(2, "0");
+    for (const s of seasons) set.add(`${s}${yStr}`);
+  }
+  return set;
+}
 
 // ── Salesforce REST helpers ───────────────────────────────────────────────────
-
 function authHeaders(token: string): Record<string, string> {
   return {
     Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
   };
 }
-
 function readHeaders(token: string): Record<string, string> {
   return { Authorization: `Bearer ${token}` };
 }
-
 async function sfUpsert(
   base: string,
   token: string,
@@ -79,7 +110,6 @@ async function sfUpsert(
   }
   throw new Error(`Upsert ${object} HTTP ${status}: ${JSON.stringify(data)}`);
 }
-
 async function sfCreate(
   base: string,
   token: string,
@@ -92,20 +122,6 @@ async function sfCreate(
     { headers: authHeaders(token) },
   );
   return data.id;
-}
-
-async function sfUpdate(
-  base: string,
-  token: string,
-  object: string,
-  id: string,
-  payload: Record<string, unknown>,
-): Promise<void> {
-  await axios.patch(
-    `${base}/services/data/${SF_API}/sobjects/${object}/${id}`,
-    payload,
-    { headers: authHeaders(token) },
-  );
 }
 
 async function sfQuery<T>(
@@ -155,75 +171,153 @@ async function buildFieldCache(
   return map;
 }
 
+// PDF: filter out junk values '00:00:00', 'False', 'None' — only load meaningful text.
+function normaliseGradeRestriction(v: string | undefined): string | null {
+  const s = (v ?? "").trim();
+  if (!s) return null;
+  const lower = s.toLowerCase();
+  if (lower === "false" || lower === "none" || lower === "00:00:00")
+    return null;
+  return s;
+}
+
+// PDF: filter out junk values '00/00/00', '0.0', 'False'.
+function normaliseInstructorPrefs(v: string | undefined): string | null {
+  const s = (v ?? "").trim();
+  if (!s) return null;
+  const lower = s.toLowerCase();
+  if (lower === "false" || s === "0.0" || lower === "00/00/00") return null;
+  return s;
+}
+
 // ── Person resolvers ──────────────────────────────────────────────────────────
+
+/**
+ * Splits a raw display name into (first, last) parts for matching against
+ * Salesforce's separate FirstName/LastName fields — ignoring any middle
+ * name/initial. See courseFlow.ts for the full rationale.
+ */
+function splitName(raw: string): { first: string; last: string } | null {
+  const s = raw.trim();
+  if (!s) return null;
+  if (s.includes(",")) {
+    const [last, first] = s.split(",").map((p) => p.trim());
+    return first && last ? { first, last } : null;
+  }
+  const parts = s.split(/\s+/).filter(Boolean);
+  if (parts.length < 2) return null;
+  return { first: parts[0], last: parts[parts.length - 1] };
+}
 
 async function resolvePersonByName(
   base: string,
   token: string,
   name: string,
   cache: Map<string, string | null>,
+  constituentRole?: string,
 ): Promise<string | null> {
   const n = name.trim();
   if (!n) return null;
-  if (cache.has(n)) return cache.get(n)!;
-  const esc = n.replace(/'/g, "\\'");
-  const rows = await sfQuery<{ PersonContactId: string }>(
-    base,
-    token,
-    `SELECT PersonContactId FROM Account WHERE IsPersonAccount = true AND Name = '${esc}' LIMIT 1`,
-  );
-  const id = rows[0]?.PersonContactId ?? null;
-  cache.set(n, id);
+  const cacheKey = constituentRole ? `${n}|${constituentRole}` : n;
+  if (cache.has(cacheKey)) return cache.get(cacheKey)!;
+
+  const roleClause =
+    constituentRole === "Instructor"
+      ? ` AND Instructor_ID_4D__c != null`
+      : constituentRole === "Associate"
+        ? ` AND Associate_ID_4D__c != null`
+        : "";
+
+  const parsed = splitName(n);
+  let id: string | null = null;
+  if (parsed) {
+    const f = parsed.first.replace(/'/g, "\\'");
+    const l = parsed.last.replace(/'/g, "\\'");
+    const rows = await sfQuery<{ PersonContactId: string }>(
+      base,
+      token,
+      `SELECT PersonContactId FROM Account WHERE IsPersonAccount = true AND ` +
+        `((FirstName = '${f}' AND LastName = '${l}') OR (FirstName = '${l}' AND LastName = '${f}'))` +
+        `${roleClause} LIMIT 1`,
+    );
+    id = rows[0]?.PersonContactId ?? null;
+  }
+
+  // Fallback: exact match on the combined Name field
+  if (!id) {
+    const esc = n.replace(/'/g, "\\'");
+    const rows = await sfQuery<{ PersonContactId: string }>(
+      base,
+      token,
+      `SELECT PersonContactId FROM Account WHERE IsPersonAccount = true AND Name = '${esc}'${roleClause} LIMIT 1`,
+    );
+    id = rows[0]?.PersonContactId ?? null;
+  }
+
+  cache.set(cacheKey, id);
   return id;
 }
 
-async function resolvePersonByExtId(
+async function resolveInstructorContactId(
   base: string,
   token: string,
-  extId: string,
+  instrId: string,
   cache: Map<string, string | null>,
 ): Promise<string | null> {
-  const e = extId.trim();
+  const e = instrId.trim();
   if (!e || e === "0") return null;
-  if (cache.has(e)) return cache.get(e)!;
+  const key = `instr_${e}`;
+  if (cache.has(key)) return cache.get(key)!;
   const rows = await sfQuery<{ PersonContactId: string }>(
     base,
     token,
-    `SELECT PersonContactId FROM Account WHERE IsPersonAccount = true AND External_ID_4D__c = '${e.replace(/'/g, "\\'")}' LIMIT 1`,
+    `SELECT PersonContactId FROM Account WHERE IsPersonAccount = true AND Instructor_ID_4D__c = '${e.replace(/'/g, "\\'")}' LIMIT 1`,
   );
   const id = rows[0]?.PersonContactId ?? null;
-  cache.set(e, id);
+  cache.set(key, id);
+  return id;
+}
+
+async function resolveAssociateContactId(
+  base: string,
+  token: string,
+  assocId: string,
+  cache: Map<string, string | null>,
+): Promise<string | null> {
+  const e = assocId.trim();
+  if (!e || e === "0") return null;
+  const key = `assoc_${e}`;
+  if (cache.has(key)) return cache.get(key)!;
+  const rows = await sfQuery<{ PersonContactId: string }>(
+    base,
+    token,
+    `SELECT PersonContactId FROM Account WHERE IsPersonAccount = true AND Associate_ID_4D__c = '${e.replace(/'/g, "\\'")}' LIMIT 1`,
+  );
+  const id = rows[0]?.PersonContactId ?? null;
+  cache.set(key, id);
   return id;
 }
 
 // ── Course-Instructor junction ────────────────────────────────────────────────
 
 interface CourseInstructorRow {
+  ID?: string;
   Course_ID?: string;
   Instructor_ID?: string;
   IsPrimary?: string;
-  Do_Not_Show_On_Web?: string;
-  Gross_Pay?: string;
-  Cont_Hourly_Rate?: string;
-  Cont_Estimated_Hours?: string;
-  Hire_Date?: string;
-  Instructor_Term_Date?: string;
-  Contract_Template?: string;
-  Salary_Category?: string;
-  Classroom_Hours?: string;
-  Notes?: string;
 }
 
 async function loadCourseInstructors(
   fileId: string,
   token: string,
 ): Promise<Map<string, CourseInstructorRow[]>> {
-  const url = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`;
+  const url = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`;
   const { data } = await axios.get<string>(url, {
+    params: { alt: "media", supportsAllDrives: "true" },
     headers: { Authorization: `Bearer ${token}` },
     responseType: "text",
   });
-  const content = data.replace(/^﻿/, "");
+  const content = data.replace(/^\uFEFF/, "");
   const { data: rows } = papaParse<CourseInstructorRow>(content, {
     header: true,
     skipEmptyLines: true,
@@ -239,7 +333,42 @@ async function loadCourseInstructors(
   return map;
 }
 
-// ── Raw row type (32 mapped fields + helpers) ─────────────────────────────────
+// ── Course-Associate junction ─────────────────────────────────────────────────
+
+interface CourseAssociateRow {
+  ID?: string;
+  Course_RecID?: string;
+  Associate_ID?: string;
+  Speaking_Date?: string;
+}
+
+async function loadCourseAssociates(
+  fileId: string,
+  token: string,
+): Promise<Map<string, CourseAssociateRow[]>> {
+  const url = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`;
+  const { data } = await axios.get<string>(url, {
+    params: { alt: "media", supportsAllDrives: "true" },
+    headers: { Authorization: `Bearer ${token}` },
+    responseType: "text",
+  });
+  const content = data.replace(/^\uFEFF/, "");
+  const { data: rows } = papaParse<CourseAssociateRow>(content, {
+    header: true,
+    skipEmptyLines: true,
+    delimiter: "\t",
+  });
+  const map = new Map<string, CourseAssociateRow[]>();
+  for (const row of rows) {
+    const cid = row.Course_RecID?.trim();
+    if (!cid) continue;
+    if (!map.has(cid)) map.set(cid, []);
+    map.get(cid)!.push(row);
+  }
+  return map;
+}
+
+// ── Raw row type (32 mapped fields + join keys) ───────────────────────────────
 
 interface RawCourseRow {
   id?: string;
@@ -274,8 +403,8 @@ interface RawCourseRow {
   Recording?: string;
   Instructor_Preferences?: string;
   Staff_Notes?: string;
-  Last_Modified_Date?: string;
   Hybrid?: string; // used to derive Format__c, not sent to SF directly
+  RecID?: string; // join key for Course_Associate junction, not sent to SF
   [key: string]: string | undefined;
 }
 
@@ -287,6 +416,7 @@ interface SuccessRow {
   Title: string;
   Quarter: string;
   Object: string;
+  fields?: Record<string, unknown>;
   sf__Id: string;
   sf__Created: string;
 }
@@ -297,15 +427,17 @@ interface ErrorRow {
   Title: string;
   Quarter: string;
   Object: string;
+  fields?: Record<string, unknown>;
   sf__Error: string;
 }
 
-// ── TSV streaming with Last_Modified_Date filter ──────────────────────────────
+// ── TSV streaming ─────────────────────────────────────────────────────────────
 
 interface StreamResult {
   rows: RawCourseRow[];
   hasMore: boolean;
   nextStartRow: number;
+  skippedByQuarter: number;
 }
 
 async function streamAndParseTsv(
@@ -313,10 +445,8 @@ async function streamAndParseTsv(
   accessToken: string,
   startRow: number,
   maxRows: number,
+  validQuarters: Set<string>,
 ): Promise<StreamResult> {
-  const cutoff = new Date();
-  cutoff.setFullYear(cutoff.getFullYear() - YEARS_BACK);
-
   const response = await axios.get(
     `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`,
     {
@@ -332,6 +462,7 @@ async function streamAndParseTsv(
     let dataRowIndex = 0;
     const rows: RawCourseRow[] = [];
     let aborted = false;
+    let skippedByQuarter = 0;
 
     papaParse(response.data as unknown as NodeJS.ReadableStream, {
       delimiter: "\t",
@@ -346,11 +477,15 @@ async function streamAndParseTsv(
         if (headers.length === 0) {
           headers = raw.map(
             (h, i) =>
-              h.replace(/^﻿/, "").replace(/\r/g, "").trim() || `__blank_${i}`,
+              h
+                .replace(/^\uFEFF/, "")
+                .replace(/\r/g, "")
+                .trim() || `__blank_${i}`,
           );
           idField =
-            headers.find((h) => h.replace(/^﻿/, "").toLowerCase() === "id") ??
-            "id";
+            headers.find(
+              (h) => h.replace(/^\uFEFF/, "").toLowerCase() === "id",
+            ) ?? "id";
           return;
         }
 
@@ -381,14 +516,13 @@ async function streamAndParseTsv(
           return;
         }
 
-        // Skip rows older than YEARS_BACK years
-        const lmd = record.Last_Modified_Date?.trim();
-        if (lmd) {
-          const d = new Date(lmd);
-          if (!isNaN(d.getTime()) && d < cutoff) {
-            dataRowIndex++;
-            return;
-          }
+        // Quarter filter — Tier 2 academic years only. Most of the file is
+        // outside this window (Tier 1 / Tier 3), so skips are counted, not logged.
+        const quarterNorm = (record.Quarter ?? "").trim().toLowerCase();
+        if (!validQuarters.has(quarterNorm)) {
+          skippedByQuarter++;
+          dataRowIndex++;
+          return;
         }
 
         rows.push(record);
@@ -396,7 +530,12 @@ async function streamAndParseTsv(
       },
 
       complete: () =>
-        resolve({ rows, hasMore: aborted, nextStartRow: dataRowIndex }),
+        resolve({
+          rows,
+          hasMore: aborted,
+          nextStartRow: dataRowIndex,
+          skippedByQuarter,
+        }),
       error: (err: Error) => reject(err),
     });
   });
@@ -430,18 +569,19 @@ export const course32fieldsImport = flow({
   name: "course32fields",
   stableKey: "d4e5f6a7-2b3c-4d5e-9f6a-bb22cc33dd44",
   description:
-    "Streams the course TSV from Google Drive, filters to the last 5 years by " +
-    "Last_Modified_Date, and maps only 32 specified fields per row to Salesforce.",
+    "Tier 2 course import: streams the course TSV, keeps academic years 2021-22 " +
+    "through 2023-24, and maps the 32 Tier 2 fields to Learning, LearningCourse, " +
+    "CourseOffering, CourseOfferingSchedule, and CourseOfferingParticipant.",
 
   onTrigger: (_context, payload) => Promise.resolve({ payload }),
 
   onExecution: async (context, params) => {
     const { logger, configVars } = context;
 
+    // ── Cursor from trigger payload ───────────────────────────────────────────
     const triggerBody = (
       params.onTrigger.results as unknown as
-        | { body?: { data?: unknown } }
-        | undefined
+        { body?: { data?: unknown } } | undefined
     )?.body?.data as Record<string, unknown> | undefined;
 
     const startRow =
@@ -453,6 +593,7 @@ export const course32fieldsImport = flow({
 
     logger.info(`[Course32] Starting at row ${startRow}`);
 
+    // ── Connections ───────────────────────────────────────────────────────────
     const gdConn = configVars[
       "Google Drive Connection"
     ] as unknown as Connection;
@@ -461,9 +602,11 @@ export const course32fieldsImport = flow({
     const instructorFileId = configVars[
       "Course Instructor File ID"
     ] as unknown as string | undefined;
+    const associateFileId = configVars[
+      "Course Associate File ID"
+    ] as unknown as string | undefined;
     const failedFolderId = configVars["Failed Records Folder ID"] as
-      | string
-      | undefined;
+      string | undefined;
 
     if (!fileId) throw new Error("Course File ID config var is empty.");
 
@@ -471,24 +614,16 @@ export const course32fieldsImport = flow({
     const sfToken = getAccessToken(sfConn);
     const sfBase = getSfInstanceUrl(sfConn);
 
-    // ── Pre-loop caches ───────────────────────────────────────────────────────
+    // ── Existing catalog records (owned by Tier 1 / newer rows) ───────────────
     logger.info("[Course32] Building lookup caches…");
-    const [sessionCache, learningCourseCache] = await Promise.all([
-      buildFieldCache(
-        sfBase,
-        sfToken,
-        "SELECT Id, Abbreviation__c FROM AcademicSession WHERE Abbreviation__c != null",
-        "Abbreviation__c",
-      ),
-      buildFieldCache(
-        sfBase,
-        sfToken,
-        "SELECT Id, External_ID_4D__c FROM LearningCourse WHERE External_ID_4D__c != null",
-        "External_ID_4D__c",
-      ),
-    ]);
+    const existingLearningCache = await buildFieldCache(
+      sfBase,
+      sfToken,
+      "SELECT Id, External_ID_4D__c FROM Learning WHERE External_ID_4D__c != null",
+      "External_ID_4D__c",
+    );
     logger.info(
-      `[Course32] Caches — sessions=${sessionCache.size}, learningCourses=${learningCourseCache.size}`,
+      `[Course32] Caches — existing Learning=${existingLearningCache.size}`,
     );
 
     // ── Course-Instructor junction ────────────────────────────────────────────
@@ -509,25 +644,105 @@ export const course32fieldsImport = flow({
       }
     }
 
+    // ── Course-Associate junction ─────────────────────────────────────────────
+    let courseAssociateMap = new Map<string, CourseAssociateRow[]>();
+    if (associateFileId) {
+      try {
+        courseAssociateMap = await loadCourseAssociates(
+          associateFileId,
+          gdToken,
+        );
+        logger.info(
+          `[Course32] Course-Associate junction loaded — ${courseAssociateMap.size} courses`,
+        );
+      } catch (err) {
+        logger.warn(
+          `[Course32] Could not load Course-Associate file: ${String(err)} — falling back to Primary_Associate field`,
+        );
+      }
+    }
+
     const personByNameCache = new Map<string, string | null>();
     const personByExtIdCache = new Map<string, string | null>();
 
     // ── Stream TSV window ─────────────────────────────────────────────────────
+    const validQuarters = buildValidQuarters(ANCHOR_QUARTER, YEARS_BACK);
     logger.info(
-      `[Course32] Streaming rows ${startRow}–${startRow + MAX_ROWS - 1}…`,
+      `[Course32] Streaming rows ${startRow}–${startRow + MAX_ROWS - 1}… valid quarters: ${[...validQuarters].join(", ")}`,
     );
-    const { rows, hasMore, nextStartRow } = await streamAndParseTsv(
-      fileId,
-      gdToken,
-      startRow,
-      MAX_ROWS,
+    const { rows, hasMore, nextStartRow, skippedByQuarter } =
+      await streamAndParseTsv(
+        fileId,
+        gdToken,
+        startRow,
+        MAX_ROWS,
+        validQuarters,
+      );
+    logger.info(
+      `[Course32] Parsed ${rows.length} rows, skipped ${skippedByQuarter} (outside Tier 2 quarters) (hasMore=${hasMore})`,
     );
-    logger.info(`[Course32] Parsed ${rows.length} rows (hasMore=${hasMore})`);
+
+    // ── Pre-warm caches for this window ──────────────────────────────────────
+    if (rows.length > 0) {
+      const allInstrIds = new Set<string>();
+      const allAssocIds = new Set<string>();
+      for (const row of rows) {
+        for (const jr of courseInstructorMap.get(str(row.id)) ?? []) {
+          if (jr.Instructor_ID?.trim())
+            allInstrIds.add(jr.Instructor_ID.trim());
+        }
+        const coord = str(row.Coordinator_ID).trim();
+        if (coord && coord !== "0") {
+          allInstrIds.add(coord);
+          allAssocIds.add(coord);
+        }
+        const assocRecId = str(row.RecID).trim();
+        for (const jr of courseAssociateMap.get(assocRecId) ?? []) {
+          if (jr.Associate_ID?.trim()) allAssocIds.add(jr.Associate_ID.trim());
+        }
+      }
+
+      await Promise.all([
+        allInstrIds.size > 0
+          ? sfQuery<{ PersonContactId: string; Instructor_ID_4D__c: string }>(
+              sfBase,
+              sfToken,
+              `SELECT PersonContactId, Instructor_ID_4D__c FROM Account WHERE IsPersonAccount = true AND Instructor_ID_4D__c IN (${[...allInstrIds].map((id) => `'${id.replace(/'/g, "\\'")}'`).join(",")})`,
+            ).then((rs) =>
+              rs.forEach((r) =>
+                personByExtIdCache.set(
+                  `instr_${r.Instructor_ID_4D__c}`,
+                  r.PersonContactId,
+                ),
+              ),
+            )
+          : Promise.resolve(),
+
+        allAssocIds.size > 0
+          ? sfQuery<{ PersonContactId: string; Associate_ID_4D__c: string }>(
+              sfBase,
+              sfToken,
+              `SELECT PersonContactId, Associate_ID_4D__c FROM Account WHERE IsPersonAccount = true AND Associate_ID_4D__c IN (${[...allAssocIds].map((id) => `'${id.replace(/'/g, "\\'")}'`).join(",")})`,
+            ).then((rs) =>
+              rs.forEach((r) =>
+                personByExtIdCache.set(
+                  `assoc_${r.Associate_ID_4D__c}`,
+                  r.PersonContactId,
+                ),
+              ),
+            )
+          : Promise.resolve(),
+      ]);
+
+      logger.info(
+        `[Course32] Pre-warmed — instrs:${allInstrIds.size} assocs:${allAssocIds.size}`,
+      );
+    }
 
     // ── Counters ──────────────────────────────────────────────────────────────
     const counts = {
-      learning: { ok: 0, err: 0 },
-      learningCourse: { ok: 0, err: 0 },
+      learning: { ok: 0, skipped: 0, err: 0 },
+      learningCourse: { ok: 0, skipped: 0, err: 0 },
       courseOffering: { ok: 0, err: 0 },
       schedule: { ok: 0, skipped: 0, err: 0 },
       copInstructor: { ok: 0, skipped: 0, err: 0 },
@@ -537,6 +752,9 @@ export const course32fieldsImport = flow({
     const successRows: SuccessRow[] = [];
     const errorRows: ErrorRow[] = [];
 
+    // Post-offering tasks collected during the row loop, fired all at once after.
+    const postOfferingTasks: (() => Promise<void>)[] = [];
+
     // ── Row loop ──────────────────────────────────────────────────────────────
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
@@ -544,103 +762,109 @@ export const course32fieldsImport = flow({
       const code = str(row.Code);
       const baseCode = stripSectionSuffix(code) || code;
       const sectionSuffix = extractSectionSuffix(code);
-      const title = str(row.Title);
+      const title = str(row.Title)
+        .replace(/_4DNL_/g, " ")
+        .trim();
       const quarter = str(row.Quarter);
 
-      const ok = (object: string, sfId: string, created: boolean) =>
+      const ok = (
+        object: string,
+        sfId: string,
+        created: boolean,
+        fields?: Record<string, unknown>,
+      ) =>
         successRows.push({
           Source_ID: sourceId,
           Code: code,
           Title: title,
           Quarter: quarter,
           Object: object,
+          fields,
           sf__Id: sfId,
           sf__Created: String(created),
         });
 
-      const fail = (object: string, error: string) =>
+      const fail = (
+        object: string,
+        error: string,
+        fields?: Record<string, unknown>,
+      ) =>
         errorRows.push({
           Source_ID: sourceId,
           Code: code,
           Title: title,
           Quarter: quarter,
           Object: object,
+          fields,
           sf__Error: error,
         });
 
-      // 1. Learning
-      let learningId: string | null = null;
-      try {
-        const r = await sfUpsert(
-          sfBase,
-          sfToken,
-          "Learning",
-          "External_ID_4D__c",
-          baseCode,
-          {
-            Name: (title || baseCode).slice(0, 255),
-            Type: "LearningCourse",
-            IsActive: true,
-          },
-        );
-        learningId = r.id;
-        counts.learning.ok++;
-        ok("Learning", r.id, r.created);
-      } catch (err) {
-        counts.learning.err++;
-        const msg = sfErrMsg(err);
-        logger.error(
-          `[Course32] Row ${startRow + i} (${sourceId}) Learning: ${msg}`,
-        );
-        fail("Learning", msg);
-        continue;
-      }
-
-      // 2. LearningCourse
-      let learningCourseId: string | null = null;
-      try {
-        let existingLcId = learningCourseCache.get(baseCode) ?? null;
-        if (!existingLcId && learningId) {
-          const found = await sfQuery<{ Id: string }>(
+      // 1–2. Learning + LearningCourse — only when this base course doesn't
+      // exist yet, so Tier 1 (newer) catalog data is never overwritten.
+      if (existingLearningCache.has(baseCode)) {
+        counts.learning.skipped++;
+        counts.learningCourse.skipped++;
+      } else {
+        const learningPayload: Record<string, unknown> = {
+          Name: (title || baseCode).slice(0, 255),
+          Type: "LearningCourse",
+          IsActive: true,
+        };
+        try {
+          const r = await sfUpsert(
             sfBase,
             sfToken,
-            `SELECT Id FROM LearningCourse WHERE LearningId = '${learningId}' LIMIT 1`,
+            "Learning",
+            "External_ID_4D__c",
+            baseCode,
+            learningPayload,
           );
-          existingLcId = found[0]?.Id ?? null;
+          existingLearningCache.set(baseCode, r.id);
+          counts.learning.ok++;
+          ok("Learning", r.id, r.created, {
+            External_ID_4D__c: baseCode,
+            ...learningPayload,
+          });
+        } catch (err) {
+          counts.learning.err++;
+          const msg = sfErrMsg(err);
+          logger.error(
+            `[Course32] Row ${startRow + i} (${sourceId}) Learning: ${msg}`,
+          );
+          fail("Learning", msg, {
+            External_ID_4D__c: baseCode,
+            ...learningPayload,
+          });
+          continue;
         }
 
         const lc: Record<string, unknown> = {
           Name: (title || baseCode).slice(0, 255),
-          External_ID_4D__c: baseCode,
           CourseNumber: baseCode.replace(/\s+/g, ""),
         };
         const catalogNotes = normaliseCatalogNotes(row.Catalog_Notes);
         if (catalogNotes) lc.Catalog_Notes__c = catalogNotes;
         const description = normaliseCatalogNotes(row.Description);
         if (description) lc.Description = description.slice(0, 32000);
-        const units = parseFloatVal(row.Units);
-        if (units !== null) lc.Units__c = units;
-
-        if (existingLcId) {
-          await sfUpdate(sfBase, sfToken, "LearningCourse", existingLcId, lc);
-          learningCourseId = existingLcId;
-          learningCourseCache.set(baseCode, existingLcId);
+        lc.Learning = { External_ID_4D__c: baseCode };
+        try {
+          const r = await sfUpsert(
+            sfBase,
+            sfToken,
+            "LearningCourse",
+            "External_ID_4D__c",
+            baseCode,
+            lc,
+          );
           counts.learningCourse.ok++;
-          ok("LearningCourse", existingLcId, false);
-        } else {
-          lc.LearningId = learningId;
-          const newId = await sfCreate(sfBase, sfToken, "LearningCourse", lc);
-          learningCourseId = newId;
-          learningCourseCache.set(baseCode, newId);
-          counts.learningCourse.ok++;
-          ok("LearningCourse", newId, true);
+          ok("LearningCourse", r.id, r.created, lc);
+        } catch (err) {
+          counts.learningCourse.err++;
+          logger.error(
+            `[Course32] Row ${startRow + i} (${sourceId}) LearningCourse: ${sfErrMsg(err)}`,
+          );
+          fail("LearningCourse", sfErrMsg(err), lc);
         }
-      } catch (err) {
-        counts.learningCourse.err++;
-        logger.error(
-          `[Course32] Row ${startRow + i} (${sourceId}) LearningCourse: ${sfErrMsg(err)}`,
-        );
-        fail("LearningCourse", sfErrMsg(err));
       }
 
       // 3. Primary Instructor — resolve via Course-Instructor junction
@@ -658,10 +882,10 @@ export const course32fieldsImport = flow({
         const instrExtId = primaryRow.Instructor_ID?.trim();
         if (instrExtId) {
           try {
-            primaryInstructorId = await resolvePersonByExtId(
+            primaryInstructorId = await resolveInstructorContactId(
               sfBase,
               sfToken,
-              `person${instrExtId}`,
+              instrExtId,
               personByExtIdCache,
             );
             if (!primaryInstructorId)
@@ -675,12 +899,14 @@ export const course32fieldsImport = flow({
           }
         }
       } else if (str(row.Primary_Instructor)) {
+        // Fallback: no junction data — look up by name
         try {
           primaryInstructorId = await resolvePersonByName(
             sfBase,
             sfToken,
             str(row.Primary_Instructor),
             personByNameCache,
+            "Instructor",
           );
           if (!primaryInstructorId)
             logger.warn(
@@ -698,12 +924,21 @@ export const course32fieldsImport = flow({
       const coordExtId = str(row.Coordinator_ID);
       if (coordExtId && coordExtId !== "0") {
         try {
-          coordId = await resolvePersonByExtId(
+          // Coordinator may be an instructor or associate — try both typed fields
+          coordId = await resolveInstructorContactId(
             sfBase,
             sfToken,
-            `person${coordExtId}`,
+            coordExtId,
             personByExtIdCache,
           );
+          if (!coordId) {
+            coordId = await resolveAssociateContactId(
+              sfBase,
+              sfToken,
+              coordExtId,
+              personByExtIdCache,
+            );
+          }
           if (!coordId)
             logger.warn(
               `[Course32] Row ${startRow + i} (${sourceId}) Coordinator not found: Coordinator_ID="${coordExtId}"`,
@@ -718,31 +953,17 @@ export const course32fieldsImport = flow({
       // 4. CourseOffering
       let courseOfferingId: string | null = null;
       const isCancelled = parseBool(row.Cancelled) === true;
-      const effectiveQuarter = (() => {
-        const m = /^([a-z]+)(\d+)$/i.exec(quarter);
-        if (m && parseInt(m[2], 10) < 13) return `${m[1].toLowerCase()}13`;
-        return quarter;
-      })();
-      const sessionId = sessionCache.get(effectiveQuarter) ?? null;
-      if (!sessionId && effectiveQuarter)
-        logger.warn(
-          `[Course32] Row ${startRow + i} (${sourceId}) AcademicSession not found for quarter "${effectiveQuarter}"`,
-        );
-
+      const co: Record<string, unknown> = {
+        Name: code || sourceId,
+        ...(sectionSuffix ? { SectionNumber: sectionSuffix } : {}),
+        // Enrollment_Status is not a Tier 2 field — derive from Cancelled only
+        Enrollment_Status__c: normaliseEnrollmentStatus(undefined, isCancelled),
+      };
+      co.LearningCourse = { External_ID_4D__c: baseCode };
+      if (quarter) co.AcademicSession = { Abbreviation__c: quarter };
+      if (primaryInstructorId) co.PrimaryFacultyId = primaryInstructorId;
+      if (coordId) co.Coordinator__c = coordId;
       try {
-        const co: Record<string, unknown> = {
-          Name: code || sourceId,
-          ...(sectionSuffix ? { SectionNumber: sectionSuffix } : {}),
-          Enrollment_Status__c: normaliseEnrollmentStatus(
-            undefined,
-            isCancelled,
-          ),
-        };
-        if (learningCourseId) co.LearningCourseId = learningCourseId;
-        if (sessionId) co.AcademicSessionId = sessionId;
-        if (primaryInstructorId) co.PrimaryFacultyId = primaryInstructorId;
-        if (coordId) co.Coordinator__c = coordId;
-
         const setDate = (field: string, v: string | undefined) => {
           const d = parseCourseDate(v);
           if (d) co[field] = d;
@@ -766,17 +987,24 @@ export const course32fieldsImport = flow({
 
         setDate("StartDate", row.Start_Date);
         setDate("EndDate", row.End_Date);
+        // EnrolleeCount is system-calculated (read-only) — cannot be written via API
+        // setInt("EnrolleeCount", row.Enrollment_Count);
         setInt("EnrollmentCapacity", row.Max_Enrollment);
-        // const dur = parseDuration(row.Duration);
-        // if (dur !== null) co.Duration_Weeks__c = dur; // field not yet in org
+        const dur = parseDurationSplit(row.Duration);
+        if (dur !== null) {
+          co.Duration_Value__c = dur.value;
+          co.Duration_Unit__c = dur.unit;
+        }
+        setFloat("Units__c", row.Units);
         setFloat("Additional_Fee__c", row.Additional_Fee);
-        setFloat("Tuition__c", row.Tuition);
+        setFloat("Tuition_Amount__c", row.Tuition);
         const staffNotes = str(row.Staff_Notes);
-        if (staffNotes) co.Staff_Notes__c = staffNotes.slice(0, 255);
+        if (staffNotes) co.Staff_Notes__c = staffNotes;
         setBool("Limited_Enrollment__c", row.Limited_Enrollment);
-        setStr("Exception_Text__c", row.Exception_Text);
+        const exceptionText = normaliseCatalogNotes(row.Exception_Text);
+        if (exceptionText) co.Exception_Text__c = exceptionText;
         const droppedSpecialPct = parseFloatVal(row.Dropped_Special_Percent);
-        if (droppedSpecialPct !== null && droppedSpecialPct < 100)
+        if (droppedSpecialPct !== null && droppedSpecialPct <= 100)
           co.Dropped_Special_Percent__c = droppedSpecialPct;
         setFloat("Global_Eval__c", row.Global_Eval);
         setFloat("Return_Rate__c", row.Return_Rate);
@@ -785,20 +1013,21 @@ export const course32fieldsImport = flow({
           normaliseFormat(row.Format, row.Hybrid) ??
           formatFromSuffix(sectionSuffix);
         if (fmt) co.Format__c = fmt;
-        setStr("Grade_Restriction__c", row.Grade_Restriction);
+        const gradeRestriction = normaliseGradeRestriction(
+          row.Grade_Restriction,
+        );
+        if (gradeRestriction) co.Grade_Restriction__c = gradeRestriction;
         setStr("Course_Version__c", row.Course_Version);
         setBool("Recording__c", row.Recording);
-        setStr(
-          "Textbook_Instructor_Preferences__c",
-          row.Instructor_Preferences,
-        );
+        const instrPrefs = normaliseInstructorPrefs(row.Instructor_Preferences);
+        if (instrPrefs) co.Textbook_Instructor_Preferences__c = instrPrefs;
 
         logger.info(
           `[Course32] Row ${startRow + i} (${sourceId}) CourseOffering required fields:` +
-            `\n  LearningCourseId  = ${co.LearningCourseId ?? "NULL"}` +
-            `\n  AcademicSessionId = ${co.AcademicSessionId ?? "NULL"} (quarter="${effectiveQuarter}")` +
+            `\n  LearningCourse     = ${baseCode} (External_ID_4D__c)` +
+            `\n  AcademicSession    = ${quarter || "NULL"} (Abbreviation__c)` +
             `\n  EnrollmentCapacity = ${co.EnrollmentCapacity ?? "NULL"}` +
-            `\n  PrimaryFacultyId  = ${co.PrimaryFacultyId ?? "NULL"}`,
+            `\n  PrimaryFacultyId   = ${co.PrimaryFacultyId ?? "NULL"}`,
         );
 
         const r = await sfUpsert(
@@ -811,60 +1040,22 @@ export const course32fieldsImport = flow({
         );
         courseOfferingId = r.id;
         counts.courseOffering.ok++;
-        ok("CourseOffering", r.id, r.created);
+        ok("CourseOffering", r.id, r.created, {
+          External_ID_4D__c: sourceId,
+          ...co,
+        });
       } catch (err) {
         counts.courseOffering.err++;
         const msg = sfErrMsg(err);
         logger.error(
           `[Course32] Row ${startRow + i} (${sourceId}) CourseOffering: ${msg}`,
         );
-        fail("CourseOffering", msg);
+        fail("CourseOffering", msg, { External_ID_4D__c: sourceId, ...co });
         continue;
       }
 
-      // 5. CourseOfferingSchedule
-      if (str(row.Weekday) || str(row.Course_Time)) {
-        try {
-          const existing = await sfQuery<{ Id: string }>(
-            sfBase,
-            sfToken,
-            `SELECT Id FROM CourseOfferingSchedule WHERE CourseOfferingId = '${courseOfferingId}' LIMIT 1`,
-          );
-          if (existing.length === 0) {
-            const dayFlags = parseWeekdays(row.Weekday);
-            const { startTime, endTime } = parseCourseTime(row.Course_Time);
-            const sched: Record<string, unknown> = {
-              CourseOfferingId: courseOfferingId,
-              Description: title || code || sourceId,
-              ...dayFlags,
-            };
-            if (startTime) sched.StartTime = startTime;
-            if (endTime && startTime && endTime > startTime)
-              sched.EndTime = endTime;
-            const schedId = await sfCreate(
-              sfBase,
-              sfToken,
-              "CourseOfferingSchedule",
-              sched,
-            );
-            counts.schedule.ok++;
-            ok("CourseOfferingSchedule", schedId, true);
-          } else {
-            counts.schedule.skipped++;
-          }
-        } catch (err) {
-          counts.schedule.err++;
-          const msg = sfErrMsg(err);
-          logger.warn(
-            `[Course32] Row ${startRow + i} (${sourceId}) Schedule: ${msg}`,
-          );
-          fail("CourseOfferingSchedule", msg);
-        }
-      } else {
-        counts.schedule.skipped++;
-      }
-
-      // 6. COP – Instructor
+      // 5-7. Post-offering operations — all independent once courseOfferingId is set.
+      // Run Schedule, COP-Instructor, COP-Associate in parallel.
       const instructorRows =
         junctionRows.length > 0
           ? junctionRows
@@ -877,101 +1068,280 @@ export const course32fieldsImport = flow({
               ]
             : [];
 
-      for (const jRow of instructorRows) {
-        const contactId = jRow.Instructor_ID?.trim()
-          ? await resolvePersonByExtId(
-              sfBase,
-              sfToken,
-              `person${jRow.Instructor_ID.trim()}`,
-              personByExtIdCache,
-            ).catch(() => null)
-          : primaryInstructorId;
+      postOfferingTasks.push(() =>
+        Promise.all([
+          // Task A: CourseOfferingSchedule (no Location — Building/Room not in Tier 2)
+          (async () => {
+            if (str(row.Weekday) || str(row.Course_Time)) {
+              try {
+                const existing = await sfQuery<{ Id: string }>(
+                  sfBase,
+                  sfToken,
+                  `SELECT Id FROM CourseOfferingSchedule WHERE CourseOfferingId = '${courseOfferingId}' LIMIT 1`,
+                );
+                if (existing.length === 0) {
+                  const dayFlags = parseWeekdays(row.Weekday);
+                  const { startTime, endTime } = parseCourseTime(
+                    row.Course_Time,
+                  );
+                  const sched: Record<string, unknown> = {
+                    CourseOfferingId: courseOfferingId,
+                    Description: title || code || sourceId,
+                    ...dayFlags,
+                  };
+                  if (startTime) sched.StartTime = startTime;
+                  if (endTime && startTime && endTime > startTime)
+                    sched.EndTime = endTime;
+                  const schedId = await sfCreate(
+                    sfBase,
+                    sfToken,
+                    "CourseOfferingSchedule",
+                    sched,
+                  );
+                  counts.schedule.ok++;
+                  ok("CourseOfferingSchedule", schedId, true, sched);
+                } else {
+                  counts.schedule.skipped++;
+                }
+              } catch (err) {
+                counts.schedule.err++;
+                const msg = sfErrMsg(err);
+                logger.warn(
+                  `[Course32] Row ${startRow + i} (${sourceId}) Schedule: ${msg}`,
+                );
+                fail("CourseOfferingSchedule", msg, {
+                  CourseOfferingId: courseOfferingId,
+                  Weekday: str(row.Weekday),
+                  Course_Time: str(row.Course_Time),
+                });
+              }
+            } else {
+              counts.schedule.skipped++;
+            }
+          })(),
 
-        if (!contactId) {
-          counts.copInstructor.skipped++;
-          continue;
-        }
-        try {
-          const existing = await sfQuery<{ Id: string }>(
-            sfBase,
-            sfToken,
-            `SELECT Id FROM CourseOfferingParticipant WHERE CourseOfferingId = '${courseOfferingId}' AND ParticipantContactId = '${contactId}' AND ParticipantAffiliation = 'Instructor' LIMIT 1`,
-          );
-          if (existing.length === 0) {
-            const copId = await sfCreate(
-              sfBase,
-              sfToken,
-              "CourseOfferingParticipant",
-              {
+          // Task B: COP-Instructor
+          (async () => {
+            for (const jRow of instructorRows) {
+              const contactId = jRow.Instructor_ID?.trim()
+                ? await resolveInstructorContactId(
+                    sfBase,
+                    sfToken,
+                    jRow.Instructor_ID.trim(),
+                    personByExtIdCache,
+                  ).catch(() => null)
+                : primaryInstructorId;
+
+              if (!contactId) {
+                counts.copInstructor.skipped++;
+                continue;
+              }
+              const instrExternal: Record<string, unknown> = {
                 CourseOfferingId: courseOfferingId,
                 ParticipantContactId: contactId,
                 ParticipantAffiliation: "Instructor",
-              },
-            );
-            counts.copInstructor.ok++;
-            ok("COP-Instructor", copId, true);
-          } else {
-            counts.copInstructor.skipped++;
-          }
-        } catch (err) {
-          counts.copInstructor.err++;
-          const msg = sfErrMsg(err);
-          logger.warn(
-            `[Course32] Row ${startRow + i} (${sourceId}) COP-Instructor: ${msg}`,
-          );
-          fail("COP-Instructor", msg);
-        }
-      }
-
-      // 7. COP – Associate
-      const assocName = str(row.Primary_Associate);
-      if (assocName && assocName !== "0") {
-        try {
-          const assocId = await resolvePersonByName(
-            sfBase,
-            sfToken,
-            assocName,
-            personByNameCache,
-          );
-          if (assocId) {
-            const existing = await sfQuery<{ Id: string }>(
-              sfBase,
-              sfToken,
-              `SELECT Id FROM CourseOfferingParticipant WHERE CourseOfferingId = '${courseOfferingId}' AND ParticipantContactId = '${assocId}' AND ParticipantAffiliation = 'Associate' LIMIT 1`,
-            );
-            if (existing.length === 0) {
-              const copId = await sfCreate(
-                sfBase,
-                sfToken,
-                "CourseOfferingParticipant",
-                {
-                  CourseOfferingId: courseOfferingId,
-                  ParticipantContactId: assocId,
-                  ParticipantAffiliation: "Associate",
-                },
-              );
-              counts.copAssociate.ok++;
-              ok("COP-Associate", copId, true);
-            } else {
-              counts.copAssociate.skipped++;
+                IsPrimary__c: parseBool(jRow.IsPrimary) ?? false,
+              };
+              const instrJunctionId = jRow.ID?.trim();
+              if (instrJunctionId)
+                instrExternal.External_ID_4D__c = `CINST-${instrJunctionId}`;
+              try {
+                const existing = await sfQuery<{ Id: string }>(
+                  sfBase,
+                  sfToken,
+                  `SELECT Id FROM CourseOfferingParticipant WHERE CourseOfferingId = '${courseOfferingId}' AND ParticipantContactId = '${contactId}' AND ParticipantAffiliation = 'Instructor' LIMIT 1`,
+                );
+                if (existing.length === 0) {
+                  const copId = await sfCreate(
+                    sfBase,
+                    sfToken,
+                    "CourseOfferingParticipant",
+                    instrExternal,
+                  );
+                  counts.copInstructor.ok++;
+                  ok("COP-Instructor", copId, true, instrExternal);
+                } else {
+                  counts.copInstructor.skipped++;
+                }
+              } catch (err) {
+                counts.copInstructor.err++;
+                const msg = sfErrMsg(err);
+                logger.warn(
+                  `[Course32] Row ${startRow + i} (${sourceId}) COP-Instructor: ${msg}`,
+                );
+                fail("COP-Instructor", msg, instrExternal);
+              }
             }
-          } else {
-            const msg = `Associate "${assocName}" not found in Salesforce`;
-            logger.warn(`[Course32] Row ${startRow + i} (${sourceId}) ${msg}`);
-            counts.copAssociate.skipped++;
-            fail("COP-Associate", msg);
-          }
-        } catch (err) {
-          counts.copAssociate.err++;
-          const msg = sfErrMsg(err);
-          logger.warn(
-            `[Course32] Row ${startRow + i} (${sourceId}) COP-Associate: ${msg}`,
-          );
-          fail("COP-Associate", msg);
-        }
-      } else {
-        counts.copAssociate.skipped++;
-      }
+          })(),
+
+          // Task C: COP-Associate
+          // Preferred: one COP per Course_Associate junction row (matched via Course.RecID).
+          // Fallback: Primary_Associate field on course row (mixed names / numeric IDs).
+          (async () => {
+            const assocRecId = str(row.RecID).trim();
+            const assocJunctionRows = assocRecId
+              ? (courseAssociateMap.get(assocRecId) ?? [])
+              : [];
+
+            if (assocJunctionRows.length > 0) {
+              for (const jRow of assocJunctionRows) {
+                const assocExtId = jRow.Associate_ID?.trim();
+                if (!assocExtId) {
+                  counts.copAssociate.skipped++;
+                  continue;
+                }
+                // Null/placeholder Speaking_Date = Course Support Specialist,
+                // real date = Guest Speaker (same rule as courseFlow.ts).
+                const affiliation =
+                  parseCourseDate(jRow.Speaking_Date) !== null
+                    ? "Guest Speaker"
+                    : "Course Support Specialist";
+                try {
+                  const assocId = await resolveAssociateContactId(
+                    sfBase,
+                    sfToken,
+                    assocExtId,
+                    personByExtIdCache,
+                  ).catch(() => null);
+                  if (assocId) {
+                    const existing = await sfQuery<{ Id: string }>(
+                      sfBase,
+                      sfToken,
+                      `SELECT Id FROM CourseOfferingParticipant WHERE CourseOfferingId = '${courseOfferingId}' AND ParticipantContactId = '${assocId}' AND ParticipantAffiliation IN ('Associate','Course Support Specialist','Guest Speaker') LIMIT 1`,
+                    );
+                    if (existing.length === 0) {
+                      const assocExternal: Record<string, unknown> = {
+                        CourseOfferingId: courseOfferingId,
+                        ParticipantContactId: assocId,
+                        ParticipantAffiliation: affiliation,
+                      };
+                      const assocJunctionId = jRow.ID?.trim();
+                      if (assocJunctionId)
+                        assocExternal.External_ID_4D__c = `CASSOC-${assocJunctionId}`;
+                      const copId = await sfCreate(
+                        sfBase,
+                        sfToken,
+                        "CourseOfferingParticipant",
+                        assocExternal,
+                      );
+                      counts.copAssociate.ok++;
+                      ok("COP-Associate", copId, true, assocExternal);
+                    } else {
+                      counts.copAssociate.skipped++;
+                    }
+                  } else {
+                    const msg = `Associate ID "${assocExtId}" not found in Salesforce`;
+                    logger.warn(
+                      `[Course32] Row ${startRow + i} (${sourceId}) COP-Associate: ${msg}`,
+                    );
+                    counts.copAssociate.skipped++;
+                    fail("COP-Associate", msg, {
+                      CourseOfferingId: courseOfferingId,
+                      Associate_ID: assocExtId,
+                      ParticipantAffiliation: affiliation,
+                    });
+                  }
+                } catch (err) {
+                  counts.copAssociate.err++;
+                  const msg = sfErrMsg(err);
+                  logger.warn(
+                    `[Course32] Row ${startRow + i} (${sourceId}) COP-Associate: ${msg}`,
+                  );
+                  fail("COP-Associate", msg, {
+                    CourseOfferingId: courseOfferingId,
+                    Associate_ID: assocExtId ?? "",
+                    ParticipantAffiliation: affiliation,
+                  });
+                }
+              }
+            } else {
+              // Fallback: Primary_Associate field — mixed numeric IDs and text names
+              const assocRaw = str(row.Primary_Associate)
+                .trim()
+                .replace(/\.0$/, "");
+              if (assocRaw && assocRaw !== "0") {
+                const isNumericAssoc = /^\d+$/.test(assocRaw);
+                const fallbackAffiliation = "Course Support Specialist";
+                try {
+                  const assocId = isNumericAssoc
+                    ? await resolveAssociateContactId(
+                        sfBase,
+                        sfToken,
+                        assocRaw,
+                        personByExtIdCache,
+                      )
+                    : await resolvePersonByName(
+                        sfBase,
+                        sfToken,
+                        assocRaw,
+                        personByNameCache,
+                        "Associate",
+                      );
+                  if (assocId) {
+                    const existing = await sfQuery<{ Id: string }>(
+                      sfBase,
+                      sfToken,
+                      `SELECT Id FROM CourseOfferingParticipant WHERE CourseOfferingId = '${courseOfferingId}' AND ParticipantContactId = '${assocId}' AND ParticipantAffiliation IN ('Associate','Course Support Specialist','Guest Speaker') LIMIT 1`,
+                    );
+                    if (existing.length === 0) {
+                      const fallbackAssocSfPayload = {
+                        CourseOfferingId: courseOfferingId,
+                        ParticipantContactId: assocId,
+                        ParticipantAffiliation: fallbackAffiliation,
+                      };
+                      const copId = await sfCreate(
+                        sfBase,
+                        sfToken,
+                        "CourseOfferingParticipant",
+                        fallbackAssocSfPayload,
+                      );
+                      counts.copAssociate.ok++;
+                      ok("COP-Associate", copId, true, {
+                        ...fallbackAssocSfPayload,
+                        Primary_Associate: assocRaw,
+                      });
+                    } else {
+                      counts.copAssociate.skipped++;
+                    }
+                  } else {
+                    const msg = `Associate "${assocRaw}" not found in Salesforce`;
+                    logger.warn(
+                      `[Course32] Row ${startRow + i} (${sourceId}) ${msg}`,
+                    );
+                    counts.copAssociate.skipped++;
+                    fail("COP-Associate", msg, {
+                      CourseOfferingId: courseOfferingId,
+                      Primary_Associate: assocRaw,
+                      ParticipantAffiliation: fallbackAffiliation,
+                    });
+                  }
+                } catch (err) {
+                  counts.copAssociate.err++;
+                  const msg = sfErrMsg(err);
+                  logger.warn(
+                    `[Course32] Row ${startRow + i} (${sourceId}) COP-Associate: ${msg}`,
+                  );
+                  fail("COP-Associate", msg, {
+                    CourseOfferingId: courseOfferingId,
+                    Primary_Associate: assocRaw,
+                    ParticipantAffiliation: fallbackAffiliation,
+                  });
+                }
+              } else {
+                counts.copAssociate.skipped++;
+              }
+            }
+          })(),
+        ]).then(() => undefined),
+      );
+    }
+
+    // ── Batch post-offering operations ────────────────────────────────────────
+    if (postOfferingTasks.length > 0) {
+      logger.info(
+        `[Course32] Firing post-offering batch for ${postOfferingTasks.length} rows simultaneously`,
+      );
+      await Promise.all(postOfferingTasks.map((t) => t()));
     }
 
     // ── Results sheet ─────────────────────────────────────────────────────────
@@ -991,22 +1361,32 @@ export const course32fieldsImport = flow({
           const sRows = successRows
             .filter((r) => r.Object === objName)
             .map(
-              ({ Source_ID, Code, Title, Quarter, sf__Id, sf__Created }) => ({
+              ({
                 Source_ID,
                 Code,
                 Title,
                 Quarter,
+                fields,
+                sf__Id,
+                sf__Created,
+              }) => ({
+                Source_ID,
+                Code,
+                Title,
+                Quarter,
+                ...fields,
                 sf__Id,
                 sf__Created,
               }),
             );
           const eRows = errorRows
             .filter((r) => r.Object === objName)
-            .map(({ Source_ID, Code, Title, Quarter, sf__Error }) => ({
+            .map(({ Source_ID, Code, Title, Quarter, fields, sf__Error }) => ({
               Source_ID,
               Code,
               Title,
               Quarter,
+              ...fields,
               sf__Error,
             }));
           return {
@@ -1045,8 +1425,8 @@ export const course32fieldsImport = flow({
     // ── Summary ───────────────────────────────────────────────────────────────
     logger.info(
       `[Course32] Window summary (rows ${startRow}–${nextStartRow - 1}):` +
-        `\n  Learning:       ${counts.learning.ok} ok, ${counts.learning.err} err` +
-        `\n  LearningCourse: ${counts.learningCourse.ok} ok, ${counts.learningCourse.err} err` +
+        `\n  Learning:       ${counts.learning.ok} ok, ${counts.learning.skipped} skip (exists), ${counts.learning.err} err` +
+        `\n  LearningCourse: ${counts.learningCourse.ok} ok, ${counts.learningCourse.skipped} skip (exists), ${counts.learningCourse.err} err` +
         `\n  CourseOffering: ${counts.courseOffering.ok} ok, ${counts.courseOffering.err} err` +
         `\n  Schedule:       ${counts.schedule.ok} ok, ${counts.schedule.skipped} skip, ${counts.schedule.err} err` +
         `\n  COP-Instructor: ${counts.copInstructor.ok} ok, ${counts.copInstructor.skipped} skip, ${counts.copInstructor.err} err` +

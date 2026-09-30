@@ -1,8 +1,16 @@
 /**
  * Stanford CSP Migration – Registration Import flow.
  *
- * Streams the Registration TSV from Google Drive and bulk-upserts FOUR
- * Salesforce objects from each source row:
+ * Windowed execution (same model as the Student flow): streams the
+ * Registration TSV from Google Drive in MAX_ROWS-row windows using HTTP
+ * Range headers (cursor = byteOffset). Each execution downloads only the
+ * bytes it needs, maps that window to Salesforce records, and bulk-upserts
+ * via Bulk API 2.0. When more rows remain the flow invokes itself
+ * recursively via context.invokeFlow, advancing the byte cursor to where
+ * the previous window ended — this is what keeps a single execution from
+ * having to hold the entire (very large) source file in memory at once.
+ *
+ * Each window bulk-upserts FOUR Salesforce objects from each source row:
  *   1. CardPaymentMethod — stored card details (billing name/address, card
  *      type, last four, expiry).
  *   2. Order             — the registration/order record itself (billing
@@ -12,8 +20,8 @@
  *      External_ID_4D__c = Registration.ID like everything else, which
  *      satisfies the workbook's "if a PaymentGroup already exists for this
  *      Order, reuse it" rule for free (a re-run just updates the same row
- *      instead of creating a duplicate). PaymentNumber is an AutoNumber —
- *      Salesforce assigns it, nothing is mapped to it.
+ *      instead of creating a duplicate). Payment_Number__c is an AutoNumber
+ *      field — Salesforce assigns it, nothing is mapped to it.
  *   4. Payment            — a single Capture/Processed payment record per
  *      registration (amount, effective date, payee, PaymentGroupId).
  *
@@ -32,9 +40,10 @@
  * Map" rows are passed through with only type coercion (currency/date
  * parsing); "Conversion" rows apply the specific logic the workbook calls
  * out in its Notes column. Anything the workbook marks "Do Not Map" is
- * intentionally excluded (Batch_Print, Created_By, Prior_Registration_ID,
- * Reconciliation_ID, Student_Country, Student_ID_Previous) — see exception
- * for audit fields below.
+ * intentionally excluded and skipped entirely, with no exceptions borrowed
+ * from other flows: Batch_Print, Created_By/Date/Time, Last_Modified_By/
+ * Date/Time, Prior_Registration_ID, Reconciliation_ID, Student_Country,
+ * Student_ID_Previous.
  *
  * PREREQUISITES (must run before this flow):
  *   Student flow — loads Person Account / Contact, both carrying
@@ -46,7 +55,7 @@
  *   (an actual email string, not a lookup) still needs a real value fetched
  *   ahead of time — see "Student email cache" below.
  *
- * Upsert key: External_ID_4D__c = Registration.ID, set on all three objects
+ * Upsert key: External_ID_4D__c = Registration.ID, set on all four objects
  *   (no prefix needed — each lives in its own object namespace, unlike the
  *   Enrollment flow's CourseOfferingParticipant which shares a namespace
  *   with instructor/associate junction rows).
@@ -62,83 +71,149 @@
  *   mapped Payment records once both finish. Each page is logged as it
  *   comes in so this step is never silently stuck.
  *
- * Compound address fields — the workbook lists target API names using
- * dotted "compound field" notation (e.g. "PaymentMethodAddress.street",
- * "BillingAddress.street"), which describes the field *grouping* in Setup
- * but is not what Bulk API 2.0 accepts on ingest (dotted names in a Bulk
- * API CSV/JSON payload mean "traverse this relationship", not "set this
- * compound sub-field"). This flow submits the actual flat, writable
- * component field names instead:
- *   CardPaymentMethod : Street, City, State, PostalCode, CountryCode
- *   Order              : BillingStreet, BillingCity, BillingState (via
- *                        BillingStateCode where the org's field is a
- *                        picklist), BillingPostalCode, BillingCountryCode
- *   ⚠ Verify these exact API names in the target org before first run —
- *     not independently confirmed against org metadata from this repo.
+ * Compound address fields — VERIFIED against the real org (`sf sobject
+ * describe` run against the STANFORD-DEV sandbox, not just the workbook):
+ *   CardPaymentMethod : PaymentMethodStreet, PaymentMethodCity,
+ *                        PaymentMethodStateCode, PaymentMethodPostalCode,
+ *                        PaymentMethodCountryCode
+ *   Order              : BillingStreet, BillingCity, BillingStateCode,
+ *                        BillingPostalCode, BillingCountryCode
+ *   The workbook's dotted notation (e.g. "PaymentMethodAddress.street")
+ *   describes the compound field *grouping* in Setup, not what Bulk API 2.0
+ *   accepts on ingest — dotted names in a Bulk API payload mean "traverse
+ *   this relationship", not "set this compound sub-field". Bulk fix applied
+ *   after the describe: CardPaymentMethod's bare Street/City/StateCode/
+ *   PostalCode/CountryCode do not exist on that object at all — real names
+ *   are "PaymentMethod"-prefixed. (Order's Billing* names were already
+ *   right.) Also confirmed: State/Country are Picklist-typed on both
+ *   objects, so the *Code component is the real writable field, not the
+ *   plain State/Country text-mirror field — this flow already used
+ *   CountryCode/BillingCountryCode but had been inconsistently writing
+ *   State/BillingState until fixed to StateCode/BillingStateCode too.
  *
- * OPEN ITEMS (need architect/SA confirmation before production run):
- *   - Order.Status — RESOLVED (addendum): defaults to "Activated" per the
- *     architect's update. (Order.EffectiveDate — RESOLVED: this org's Order
- *     object has no such field; EffectiveDate only exists on Payment,
- *     already mapped there per the workbook.)
- *   - Payment.PaymentGroupId — RESOLVED (addendum): the architect's update
- *     specifies Payment.PaymentGroupId → PaymentGroup, created per-Order
- *     via PaymentGroup.SourceObjectId = Order.Id, reused on re-run. (An
- *     earlier manual test showed PaymentGroup isn't strictly *required* to
- *     save a Payment in this org, but the workbook now asks for it to be
- *     populated regardless, so this flow does.)
- *   - PaymentGroup.External_ID_4D__c — ASSUMPTION, not in the workbook: the
- *     workbook doesn't map an upsert key for PaymentGroup at all, only
- *     describing "reuse if one already exists for this Order" in prose.
- *     This flow gives PaymentGroup its own External_ID_4D__c =
- *     Registration.ID (same convention as every other object here), which
- *     satisfies that reuse requirement via ordinary upsert semantics
- *     without a separate existence-check query. Confirm PaymentGroup
- *     actually has that custom field in the target org — if not, this
- *     needs to change to a SOQL existence-check on SourceObjectId instead.
- *   - PaymentGroup — confirm no other fields are required to save one
- *     beyond SourceObjectId (mirrors the earlier Order.Status surprise —
- *     the workbook only mentions SourceObjectId and the auto-generated
- *     PaymentNumber).
- *   - Payment.GroupPayee — RESOLVED: confirmed as a real custom field on
- *     Payment, GroupPayee__c (Text(255)), populated with the student's
- *     email. (Workbook listed it as "GroupPayee" with no "__c" — the
- *     actual API name has the custom-field suffix.)
- *   - CC_Transaction_ID → Order.OrderReferenceNumber is marked
- *     "Conversion" in the workbook but no logic is described — this flow
- *     passes the raw value through unchanged.
- *   - Check_No → Order.Check_Number__c is typed "Number" in the workbook;
- *     non-numeric values (if any exist in source data) are skipped with a
- *     warning rather than silently truncated.
- *   - Audit fields (CreatedDate/LastModifiedDate on Order): workbook marks
- *     Created_By/Date/Time and Last_Modified_By/Date/Time "Do Not Map",
- *     but per the same precedent set in the Enrollment flow, this flow
- *     still writes them to the standard CreatedDate/LastModifiedDate
- *     fields (requires "Set Audit Fields upon Record Creation" / "Create
- *     Audit Fields" permission for the migration user). Remove if that
- *     precedent doesn't apply here.
- *   - External_Id_4D field: workbook writes "External_Id_4D" (no object
- *     given on that row — appears to apply to all three target objects).
- *     This flow uses the project-wide convention External_ID_4D__c;
- *     confirm that custom field exists on CardPaymentMethod, Order, and
- *     Payment in the target org.
- *   - Relationship names assumed for the external-ID lookup trick:
- *     `Account.Student_ID_4D__c` for AccountId and
- *     `BillToContact.Student_ID_4D__c` for BillToContactId (Salesforce's
- *     auto-generated relationship name for a standard "...Id" field is the
- *     field name minus "Id" — Account for AccountId, BillToContact for
- *     BillToContactId). Confirm both `Student_ID_4D__c` fields are flagged
- *     "External ID" in Setup — Bulk API will reject the relationship
- *     reference outright (a clear per-batch error, not a hang) if not.
- *     A row whose Student_ID doesn't match any Account/Contact now fails
- *     silently into the Bulk API failed-records CSV (visible in the
- *     results sheet) rather than a pre-check warning in the flow log,
- *     since there's no local cache to check against anymore.
+ * ══════════════════════════════════════════════════════════════════════════
+ * VERIFIED 2026-09-29 via `sf sobject describe` against the STANFORD-DEV
+ * sandbox (not just the workbook). This is real org metadata, not
+ * assumption — see below for what's confirmed working vs. what's a hard
+ * blocker right now.
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * ✅ CONFIRMED against Stanford_UAT (the authoritative org — confirmed
+ * 2026-09-29 after STANFORD-DEV and Stanford_UAT were found out of sync;
+ * UAT is the one that matters). No changes needed, all verified working:
+ *   - External_ID_4D__c exists and is flagged External ID on all 4 objects
+ *     this flow writes to (CardPaymentMethod, Order, PaymentGroup, Payment)
+ *     plus Account/Contact (used by the relationship-syntax lookups).
+ *   - All 9 of Order's mapped custom fields exist: Adjustment__c,
+ *     Balance_Due__c, Check_Amount__c, Check_Number__c, Courses_Subtotal__c,
+ *     Discount_Amount__c, TA_Discount_Type__c, Registration_Fee__c,
+ *     Registration_Date__c.
+ *   - Payment.GroupPayee__c exists (Text 255) — initially came back missing
+ *     from an `sf sobject describe` check, which turned out to be a
+ *     Field-Level Security restriction on the checking user, not a missing
+ *     field (Setup showed it fine). FLS was updated to grant the migration
+ *     permission set access, re-verified accessible via describe after.
+ *     Worth remembering: a field "missing" from describe() can mean FLS,
+ *     not "doesn't exist" — check Setup directly if a describe result looks
+ *     surprising.
+ *   - PaymentGroup.SourceObjectId exists; no other field is required to
+ *     save one — confirmed independently both by describe() (only 9 fields
+ *     total on the object) and by the architect directly in a design
+ *     review call ("the payment group itself doesn't really have any other
+ *     fields on it... it's the ID and then here's your source object").
+ *     That same call also confirmed creating a new PaymentGroup per
+ *     registration (rather than a stricter reuse-lookup) is fine — matches
+ *     this flow's upsert-by-External_ID_4D__c approach already.
+ *   - PaymentGroup's AutoNumber field is actually named PaymentGroupNumber
+ *     in this org — neither "PaymentNumber" nor "Payment_Number__c", the
+ *     two names the workbook has used across its revisions. Not mapped to
+ *     either way since it's AutoNumber, but worth knowing for accuracy.
+ *   - CardPaymentMethod/Order/Payment's other fields (AccountId,
+ *     BillToContactId, billing address, Status, OrderReferenceNumber,
+ *     PoDate, Description, CardType, ExpiryMonth/Year, CardLastFour,
+ *     CardHolderFirstName/LastName, Type, Amount, PaymentGroupId) all exist
+ *     with the expected types. (Order.TotalAmount is the one exception —
+ *     see the 2026-09-30 real-run findings below: it exists but isn't
+ *     writable by anyone, which `describe()` alone didn't make obvious.)
+ *
+ * 🐛 BUGS FOUND AND FIXED BY THIS VERIFICATION:
+ *   - CardPaymentMethod's address fields were wrong. Bare Street/City/
+ *     StateCode/PostalCode/CountryCode do not exist on this object — the
+ *     real fields are prefixed "PaymentMethod" (PaymentMethodStreet, etc.).
+ *     Every CardPaymentMethod record would have been rejected outright.
+ *     Fixed.
+ *   - Order.EffectiveDate: previously believed (from a prior manual check)
+ *     not to exist on Order at all, and the mapping was removed on that
+ *     basis. The describe call shows it DOES exist and is REQUIRED. That
+ *     earlier information was wrong — restored the mapping (Registration_Date
+ *     falling back to PoDate), since without it every Order fails to save.
+ *     Still no real source mapped to it in the workbook — confirm with
+ *     architect whether the Registration_Date fallback is correct.
+ *   - State/Country picklist fields: this flow was inconsistently writing
+ *     State/BillingState instead of StateCode/BillingStateCode (while
+ *     already correctly using CountryCode/BillingCountryCode) — fixed.
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ * FIRST REAL BULK API RUN — 2026-09-30, 100 records/object against
+ * Stanford_UAT (TEST_MODE window 1). All 300 records failed; every failure
+ * had a specific, actionable Bulk API error — none were silent or generic.
+ * This surfaced 4 things `sf sobject describe` alone didn't catch, since it
+ * shows a field exists but not always whether it's actually writable or
+ * what a default should be:
+ * ══════════════════════════════════════════════════════════════════════════
+ *   - CardPaymentMethod.Status and .ProcessingMode — both required, neither
+ *     in the workbook, neither had a code default. FIXED: Status="Active",
+ *     ProcessingMode="External" (both guesses — see field default comments).
+ *   - Payment.ProcessingMode — same field, same fix, same guess.
+ *   - Order.TotalAmount — NOT a Field-Level Security issue like GroupPayee__c
+ *     was. `describe()` shows createable=false/updateable=false — nobody can
+ *     write this field via API, most likely because it's a rollup from Order
+ *     Product line items. REMOVED the CC_Amt → TotalAmount mapping entirely;
+ *     the value is still captured on Payment.Amount. Flag to architect: was
+ *     OrderItems supposed to be created to drive this rollup?
+ *   - Order.TA_Discount_Type__c — real source values ("65+", "MLA",
+ *     "SAA onetime", "Teacher", ...) don't match any of the object's actual
+ *     picklist values ("Senior 65+", "Stanford Affiliate", "SAA Member",
+ *     "Educator", etc. — see VALID_TA_DISCOUNT_TYPES). The workbook called
+ *     this "Direct Map"; it isn't. FIXED (defensively): only an exact match
+ *     is now set, anything else is skipped with a warning instead of
+ *     rejecting the whole Order record — but the real source→target mapping
+ *     still needs the architect (some pairs look obvious — "65+" →
+ *     "Senior 65+" — others don't, e.g. "MLA").
+ *
+ * ⚠️  STILL UNVERIFIED / OPEN:
+ *   - CC_Transaction_ID → Order.OrderReferenceNumber is marked "Conversion"
+ *     in the workbook but no logic is described — passthrough as-is.
+ *   - Check_No → Order.Check_Number__c is typed "Number"; non-numeric
+ *     values are skipped with a warning, not preserved anywhere.
+ *   - Audit fields — RESOLVED: Created_By/Date/Time and Last_Modified_By/
+ *     Date/Time are "Do Not Map" per this workbook and are skipped
+ *     entirely. Each flow's mapping is independent — this flow does not
+ *     borrow the Enrollment flow's separate audit-field override, since
+ *     Registration's own workbook doesn't ask for it.
+ *   - The cash/check-paid-registration gap: CardPaymentMethod and a
+ *     Type="Capture" Payment are still created unconditionally for every
+ *     registration, even ones proven (via Check_No values like "cash",
+ *     "SNAP - C100461") to not have used a card at all.
+ *   - No 2-year window scope, unlike Textbook/Transcript/Coursework flows —
+ *     this flow currently imports full history back to 2008.
+ *   - Windowed execution (new): rebuilds the ~190k-row Student email cache
+ *     on every window rather than once for the whole file, since each
+ *     execution is otherwise stateless. MAX_ROWS=25,000 keeps this to a few
+ *     dozen rebuilds for the full file rather than hundreds — if the real
+ *     row count turns out much larger than expected, or the cache rebuild
+ *     cost becomes a real problem, worth revisiting (e.g. a wider MAX_ROWS,
+ *     or caching the email lookup somewhere windows can share).
  */
 
 import { flow, type Connection } from "@prismatic-io/spectral";
 import axios from "axios";
-import Papa, { parse as papaParse } from "papaparse";
+import Papa, {
+  parse as papaParse,
+  type ParseResult,
+  type Parser,
+} from "papaparse";
+import { Transform } from "stream";
 import {
   str,
   toDate,
@@ -157,11 +232,36 @@ const SF_CARD_PAYMENT_METHOD = "CardPaymentMethod";
 const SF_ORDER = "Order";
 const SF_PAYMENT_GROUP = "PaymentGroup";
 const SF_PAYMENT = "Payment";
-const TEST_MODE = true; // set to false to process all records
-const TEST_LIMIT = 100; // max records (per object) to upsert when TEST_MODE is true
+// Rows per execution window (see "Windowed execution" note in the header
+// comment). Bounded well under BULK_BATCH_SIZE so each window submits
+// exactly one Bulk API batch per object.
+const MAX_ROWS = 25_000;
+
+const TEST_MODE = true; // when true: process one window only, then stop (no self-invoke)
+const TEST_LIMIT = 100; // additionally cap records (per object) within that one window
 
 // Order.Status default — per architect addendum, see OPEN ITEMS above.
 const DEFAULT_ORDER_STATUS = "Activated";
+
+// Order.TA_Discount_Type__c — real picklist values confirmed via
+// `sf sobject describe` against Stanford_UAT. Raw source Discount_Type
+// values ("65+", "MLA", "SAA onetime", "Teacher", ...) don't match any of
+// these — see OPEN ITEMS. Only an exact match is set; anything else is
+// skipped with a warning rather than sent and rejecting the whole Order.
+const VALID_TA_DISCOUNT_TYPES = new Set([
+  "Senior 65+",
+  "Stanford Affiliate",
+  "Stanford Healthcare",
+  "SAA Member",
+  "SBSAA Member",
+  "CSP Full",
+  "Century Club V1",
+  "Century Club V2",
+  "DCI",
+  "Educator",
+  "Promo Code",
+  "STAP Benefit",
+]);
 
 // ── Raw row type ──────────────────────────────────────────────────────────────
 
@@ -187,14 +287,14 @@ interface RawRegistrationRow {
   Check_Amt?: string;
   Check_No?: string;
   Courses_Subtotal?: string;
-  Created_By?: string; // Do Not Map (field-level) — see audit-field note above
-  Created_Date?: string;
-  Created_Time?: string;
+  Created_By?: string; // Do Not Map
+  Created_Date?: string; // Do Not Map
+  Created_Time?: string; // Do Not Map
   Discount_Amt?: string;
   Discount_Type?: string;
-  Last_Modified_By?: string; // Do Not Map (field-level) — see audit-field note above
-  Last_Modified_Date?: string;
-  Last_Modified_Time?: string;
+  Last_Modified_By?: string; // Do Not Map
+  Last_Modified_Date?: string; // Do Not Map
+  Last_Modified_Time?: string; // Do Not Map
   Notes?: string;
   Prior_Registration_ID?: string; // Do Not Map
   Reconciliation_ID?: string; // Do Not Map
@@ -224,16 +324,6 @@ function parseInteger(raw: string | undefined): number | undefined {
   if (!s) return undefined;
   const n = parseInt(s, 10);
   return isNaN(n) ? undefined : n;
-}
-
-function combineDateTime(
-  dateRaw: string | undefined,
-  timeRaw: string | undefined,
-): string | undefined {
-  const d = toDate(dateRaw);
-  if (!d) return undefined;
-  const t = str(timeRaw).trim() || "00:00:00";
-  return `${d}T${t}.000Z`;
 }
 
 /**
@@ -353,7 +443,18 @@ function mapToCardPaymentMethod(raw: RawRegistrationRow): SfRecord | null {
   const id = str(raw.ID).trim();
   if (!id) return null;
 
-  const record: SfRecord = { [EXT_ID_FIELD]: id };
+  // Status and ProcessingMode are both required (confirmed via `sf sobject
+  // describe`) and not in the workbook at all — every CardPaymentMethod
+  // upload failed with REQUIRED_FIELD_MISSING before these were added.
+  // Status picklist: Active / InActive / Canceled — "Active" assumed for a
+  // migrated card on file. ProcessingMode picklist: Salesforce / External —
+  // "External" assumed since this is a migrated historical record, not one
+  // Salesforce itself processed. Both are guesses; confirm with architect.
+  const record: SfRecord = {
+    [EXT_ID_FIELD]: id,
+    Status: "Active",
+    ProcessingMode: "External",
+  };
 
   // AccountId — resolved by Salesforce during the Bulk API job via external-ID
   // relationship syntax; no pre-fetch needed. See OPEN ITEMS re: relationship name.
@@ -362,13 +463,17 @@ function mapToCardPaymentMethod(raw: RawRegistrationRow): SfRecord | null {
     record["Account.Student_ID_4D__c"] = studentId;
   }
 
+  // Real field names confirmed via `sf sobject describe CardPaymentMethod`
+  // against STANFORD-DEV: the PaymentMethodAddress compound field's flat,
+  // writable components are prefixed "PaymentMethod", not bare Street/City/
+  // etc. (which don't exist on this object at all).
   const { street, city, countryCode, stateCode, zip } =
     billingAddressFields(raw);
-  if (street) record.Street = street;
-  if (city) record.City = city;
-  if (countryCode) record.CountryCode = countryCode;
-  if (stateCode) record.State = stateCode;
-  if (zip) record.PostalCode = zip;
+  if (street) record.PaymentMethodStreet = street;
+  if (city) record.PaymentMethodCity = city;
+  if (countryCode) record.PaymentMethodCountryCode = countryCode;
+  if (stateCode) record.PaymentMethodStateCode = stateCode;
+  if (zip) record.PaymentMethodPostalCode = zip;
 
   const cardType = str(raw.CC_Card_Type);
   if (cardType) record.CardType = cardType; // Direct Map per workbook
@@ -417,7 +522,7 @@ function mapToOrder(
   if (street) record.BillingStreet = street;
   if (city) record.BillingCity = city;
   if (countryCode) record.BillingCountryCode = countryCode;
-  if (stateCode) record.BillingState = stateCode;
+  if (stateCode) record.BillingStateCode = stateCode; // Picklist per workbook
   if (zip) record.BillingPostalCode = zip;
 
   const adjustment = parseCurrency(raw.Adjustment);
@@ -428,8 +533,17 @@ function mapToOrder(
 
   // Batch_Print — Do Not Map
 
-  const totalAmount = parseCurrency(raw.CC_Amt);
-  if (totalAmount !== undefined) record.TotalAmount = totalAmount;
+  // TotalAmount — REMOVED. Workbook maps CC_Amt here as "Direct Map", but
+  // `sf sobject describe` shows createable=false, updateable=false on this
+  // field in the real org — not a Field-Level Security issue (that can be
+  // granted per-profile), this field structurally cannot be written via API
+  // by anyone, most likely because it's a rollup calculated from Order
+  // Product line items. Every Order upload failed with
+  // INVALID_FIELD_FOR_INSERT_UPDATE on this field before it was removed.
+  // CC_Amt is still captured on Payment.Amount, so the value isn't lost —
+  // just not duplicated onto Order. Flag to architect: was OrderItems
+  // supposed to be created to drive this rollup, or should CC_Amt go
+  // somewhere else on Order?
 
   // OrderReferenceNumber — workbook marks "Conversion" with no described logic;
   // passthrough raw value. See OPEN ITEMS.
@@ -462,7 +576,16 @@ function mapToOrder(
   if (discountAmt !== undefined) record.Discount_Amount__c = discountAmt;
 
   const discountType = str(raw.Discount_Type);
-  if (discountType) record.TA_Discount_Type__c = discountType; // Direct Map per workbook
+  if (discountType) {
+    if (VALID_TA_DISCOUNT_TYPES.has(discountType)) {
+      record.TA_Discount_Type__c = discountType;
+    } else {
+      logger.warn(
+        `[Registration Import][Order] Discount_Type "${discountType}" for Registration ${id} ` +
+          "doesn't match any TA_Discount_Type__c picklist value — skipped (field left blank)",
+      );
+    }
+  }
 
   const notes = str(raw.Notes)
     .replace(/_4DNL_/g, "\n")
@@ -475,15 +598,18 @@ function mapToOrder(
   const regDate = toDate(raw.Registration_Date);
   if (regDate) record.Registration_Date__c = regDate;
 
-  // Audit fields — see OPEN ITEMS (mirrors Enrollment flow precedent).
-  const createdDateTime = combineDateTime(raw.Created_Date, raw.Created_Time);
-  if (createdDateTime) record.CreatedDate = createdDateTime;
+  // Order.EffectiveDate — confirmed via `sf sobject describe` against
+  // STANFORD-DEV: this field exists and is REQUIRED. Not in the workbook at
+  // all, so this flow falls back Registration_Date → PoDate; if neither is
+  // present, the Order will fail to save (needs an architect decision on
+  // the real source, but this is strictly better than omitting it outright).
+  const effectiveDate = regDate || poDate;
+  if (effectiveDate) record.EffectiveDate = effectiveDate;
 
-  const lastModDate = toDate(raw.Last_Modified_Date);
-  const lastModDateTime = lastModDate
-    ? combineDateTime(raw.Last_Modified_Date, raw.Last_Modified_Time)
-    : createdDateTime;
-  if (lastModDateTime) record.LastModifiedDate = lastModDateTime;
+  // Created_By/Date/Time, Last_Modified_By/Date/Time — Do Not Map per this
+  // workbook. Each flow's mapping is independent; not borrowing Enrollment's
+  // audit-field override here since Registration's own workbook doesn't ask
+  // for it.
 
   return record;
 }
@@ -501,6 +627,11 @@ function mapToPayment(raw: RawRegistrationRow): SfRecord | null {
     [EXT_ID_FIELD]: id,
     Type: "Capture", // Default value per workbook
     Status: "Processed", // Default value per workbook
+    // ProcessingMode is required (confirmed via describe) and not in the
+    // workbook — every Payment upload failed with REQUIRED_FIELD_MISSING
+    // before this was added. Same assumption as CardPaymentMethod: "External"
+    // since this is a migrated historical record. Confirm with architect.
+    ProcessingMode: "External",
   };
 
   // AccountId — resolved by Salesforce during the Bulk API job via
@@ -523,48 +654,118 @@ function mapToPayment(raw: RawRegistrationRow): SfRecord | null {
   return record;
 }
 
-// ── TSV streaming ──────────────────────────────────────────────────────────────
+// ── TSV streaming (windowed) ────────────────────────────────────────────────
+// Same mechanism as the Student flow: an HTTP Range header downloads only the
+// bytes needed for this window (byteOffset onward), a Transform stream tracks
+// the exact file-byte position after every newline (accurate even for
+// multi-byte UTF-8 characters, unlike PapaParse's own character-counting
+// cursor), and parsing stops once MAX_ROWS rows have been mapped. The byte
+// position of the last *fully processed* row becomes nextByteOffset — the
+// exact resume point for the next window, with no gap or overlap.
 
-async function streamAndMap(
-  fileId: string,
-  accessToken: string,
-  logger: { info: (m: string) => void; warn: (m: string) => void },
-): Promise<{
+interface WindowStreamResult {
   cardPaymentMethods: SfRecord[];
   orders: SfRecord[];
   payments: SfRecord[];
-  totalRows: number;
-}> {
+  rowsInWindow: number;
+  hasMore: boolean;
+  nextByteOffset: number;
+  parsedHeaders: string[];
+}
+
+async function streamAndMapWindow(
+  fileId: string,
+  accessToken: string,
+  byteOffset: number,
+  maxRows: number,
+  knownHeaders: string[],
+  logger: { info: (m: string) => void; warn: (m: string) => void },
+): Promise<WindowStreamResult> {
+  const reqHeaders: Record<string, string> = {
+    Authorization: `Bearer ${accessToken}`,
+  };
+  if (byteOffset > 0) {
+    reqHeaders.Range = `bytes=${byteOffset}-`;
+  }
+
   const response = await axios.get(
     `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`,
     {
       params: { alt: "media", supportsAllDrives: "true" },
-      headers: { Authorization: `Bearer ${accessToken}` },
+      headers: reqHeaders,
       responseType: "stream",
     },
   );
 
+  const lineEndBytes: number[] = [];
+  let totalBytesReceived = 0;
+
+  const byteTracker = new Transform({
+    transform(
+      chunk: Buffer,
+      _encoding: BufferEncoding,
+      callback: (err?: Error | null, data?: Buffer) => void,
+    ) {
+      for (let i = 0; i < chunk.length; i++) {
+        if (chunk[i] === 0x0a) {
+          lineEndBytes.push(byteOffset + totalBytesReceived + i + 1);
+        }
+      }
+      totalBytesReceived += chunk.length;
+      callback(null, chunk);
+    },
+  });
+
+  (response.data as NodeJS.ReadableStream).pipe(byteTracker);
+
   return new Promise((resolve, reject) => {
+    // For byteOffset > 0 this window has no header row — use knownHeaders
+    // passed down from the previous window via the self-invoke payload.
+    let headers: string[] = knownHeaders.length > 0 ? [...knownHeaders] : [];
     const cardPaymentMethods: SfRecord[] = [];
     const orders: SfRecord[] = [];
     const payments: SfRecord[] = [];
-    let headers: string[] = [];
-    let totalRows = 0;
+    let rowsInWindow = 0;
+    let aborted = false;
+    // Byte position after the last fully-processed row. Updated BEFORE the
+    // maxRows check below, so when we abort, this already points to the
+    // start of the first unprocessed row — the correct resume point.
+    let lastCompletedCursor = byteOffset;
+    let stepCount = 0;
 
-    papaParse(response.data as unknown as NodeJS.ReadableStream, {
+    papaParse(byteTracker as unknown as NodeJS.ReadableStream, {
       delimiter: "\t",
       quoteChar: "\0",
       header: false,
-      skipEmptyLines: true,
+      // Must be false so step() fires for every raw line (including empty
+      // ones), keeping stepCount in sync with lineEndBytes.
+      skipEmptyLines: false,
 
-      step: (result: Papa.ParseResult<string[]>) => {
+      step: (result: ParseResult<string[]>, parser: Parser) => {
+        if (aborted) return;
+
         const raw = result.data as unknown as string[];
+        const rowEndByte =
+          lineEndBytes[stepCount] ?? byteOffset + totalBytesReceived;
+        stepCount++;
+
+        if (raw.length === 0 || raw.every((c) => c.replace(/\r/g, "") === "")) {
+          lastCompletedCursor = rowEndByte;
+          return;
+        }
 
         if (headers.length === 0) {
           headers = raw.map(
             (h, i) =>
               h.replace(/^﻿/, "").replace(/\r/g, "").trim() || `__blank_${i}`,
           );
+          lastCompletedCursor = rowEndByte;
+          return;
+        }
+
+        if (rowsInWindow >= maxRows) {
+          aborted = true;
+          parser.abort();
           return;
         }
 
@@ -575,8 +776,11 @@ async function streamAndMap(
           }
         });
 
-        if (!str(row.ID).trim()) return;
-        totalRows++;
+        if (!str(row.ID).trim()) {
+          lastCompletedCursor = rowEndByte;
+          return;
+        }
+        rowsInWindow++;
 
         const cpm = mapToCardPaymentMethod(row);
         if (cpm) cardPaymentMethods.push(cpm);
@@ -586,10 +790,20 @@ async function streamAndMap(
 
         const payment = mapToPayment(row);
         if (payment) payments.push(payment);
+
+        lastCompletedCursor = rowEndByte;
       },
 
       complete: () =>
-        resolve({ cardPaymentMethods, orders, payments, totalRows }),
+        resolve({
+          cardPaymentMethods,
+          orders,
+          payments,
+          rowsInWindow,
+          hasMore: aborted,
+          nextByteOffset: lastCompletedCursor,
+          parsedHeaders: headers,
+        }),
       error: (err: Error) => reject(err),
     });
   });
@@ -674,20 +888,49 @@ function parseSuccessfulSfIds(
 }
 
 // ── Flow ──────────────────────────────────────────────────────────────────────
+// Windowed execution (same model as the Student flow): each execution reads
+// and processes at most MAX_ROWS rows, starting from a byte-offset cursor
+// carried in the trigger payload. When more rows remain, this flow invokes
+// itself via context.invokeFlow with the next byte offset, so a file with
+// hundreds of thousands of rows runs as a chain of many small, well-bounded
+// executions instead of one giant one. TEST_MODE stops that chain after a
+// single window regardless of how much of the file remains.
 
 export const registrationImport = flow({
   name: "Registration Import",
   stableKey: "reg22334-4556-4778-9900-aabbccddeeff",
   description:
-    "Streams the Registration TSV from Google Drive and bulk-upserts " +
-    "CardPaymentMethod, Order, and Payment records via Bulk API 2.0. " +
-    "Must run after the Student flow.",
+    "Streams the Registration TSV from Google Drive one window at a time " +
+    "and bulk-upserts CardPaymentMethod, Order, PaymentGroup, and Payment " +
+    "records via Bulk API 2.0. Recurses until the full file has been " +
+    "processed. Must run after the Student flow.",
 
-  onTrigger: (_context, payload) => Promise.resolve({ payload }),
+  onTrigger: async (_context, payload) => {
+    await Promise.resolve();
+    return { payload };
+  },
 
-  onExecution: async (context, _params) => {
+  onExecution: async (context, params) => {
     const { logger, configVars } = context;
-    logger.info("[Registration Import] Starting…");
+
+    // ── Read cursor (byteOffset) from trigger payload ────────────────────────
+    const triggerBody = (
+      params.onTrigger.results as unknown as
+        { body?: { data?: unknown } } | undefined
+    )?.body?.data as Record<string, unknown> | undefined;
+    const byteOffset =
+      typeof triggerBody?.byteOffset === "number" ? triggerBody.byteOffset : 0;
+    const knownHeaders = Array.isArray(triggerBody?.headers)
+      ? (triggerBody.headers as string[])
+      : [];
+    const windowNumber =
+      typeof triggerBody?.windowNumber === "number"
+        ? triggerBody.windowNumber
+        : 1;
+
+    logger.info(
+      `[Registration Import] Starting window ${windowNumber} at byte ${byteOffset}…`,
+    );
 
     // ── Connections ───────────────────────────────────────────────────────────
     const gdConn = configVars[
@@ -704,27 +947,40 @@ export const registrationImport = flow({
     const sfToken = getAccessToken(sfConn);
     const sfBase = getSfInstanceUrl(sfConn);
 
-    // ── Build email cache + stream/map in parallel ───────────────────────────
+    // ── Build email cache + stream/map this window in parallel ───────────────
     // Neither depends on the other any more: AccountId/BillToContactId are
     // resolved by Salesforce itself (external-ID relationship syntax), so
     // the only thing the cache still feeds is GroupPayee, stitched on below
-    // once both finish.
+    // once both finish. The cache is rebuilt every window (~190k accounts,
+    // ~95 pages) — a real cost of windowing, traded off against MAX_ROWS
+    // being wide enough (25,000) that it's only paid a few dozen times for
+    // the whole file rather than once per tiny window.
     logger.info(
-      "[Registration Import] Building Student email cache and streaming " +
-        "Registration TSV in parallel…",
+      `[Registration Import] Window ${windowNumber}: building Student email ` +
+        "cache and streaming this window of the Registration TSV in parallel…",
     );
-    const [emailCache, streamResult] = await Promise.all([
+    const [emailCache, windowResult] = await Promise.all([
       buildStudentEmailCache(sfBase, sfToken, logger),
-      streamAndMap(fileId, gdToken, logger),
+      streamAndMapWindow(
+        fileId,
+        gdToken,
+        byteOffset,
+        MAX_ROWS,
+        knownHeaders,
+        logger,
+      ),
     ]);
     logger.info(
       `[Registration Import] Email cache — students=${emailCache.size}`,
     );
 
-    let { cardPaymentMethods, orders, payments, totalRows } = streamResult;
+    let { cardPaymentMethods, orders, payments } = windowResult;
+    const { rowsInWindow, hasMore, nextByteOffset, parsedHeaders } =
+      windowResult;
 
     logger.info(
-      `[Registration Import] Stream complete — total=${totalRows}, ` +
+      `[Registration Import] Window ${windowNumber} stream complete — ` +
+        `rows=${rowsInWindow}, hasMore=${hasMore}, nextByte=${nextByteOffset}, ` +
         `cardPaymentMethods=${cardPaymentMethods.length}, orders=${orders.length}, ` +
         `payments=${payments.length}`,
     );
@@ -754,19 +1010,19 @@ export const registrationImport = flow({
       orders = orders.slice(0, TEST_LIMIT);
       payments = payments.slice(0, TEST_LIMIT);
       logger.info(
-        `[Registration Import] TEST MODE: limited to first ${TEST_LIMIT} records per object`,
+        `[Registration Import] TEST MODE: limited to first ${TEST_LIMIT} records per object, and won't invoke the next window.`,
       );
     }
 
+    // ── Upsert this window's records (skipped entirely if the window was empty) ──
     if (
       cardPaymentMethods.length === 0 &&
       orders.length === 0 &&
       payments.length === 0
     ) {
-      logger.info("[Registration Import] No records to upsert — done.");
-      return {
-        data: { totalRows, cardPaymentMethods: 0, orders: 0, payments: 0 },
-      };
+      logger.info(
+        `[Registration Import] Window ${windowNumber}: no records to upsert.`,
+      );
     }
 
     // ── Phase 1: CardPaymentMethod ────────────────────────────────────────────
@@ -947,17 +1203,47 @@ export const registrationImport = flow({
 
     // ── Summary ───────────────────────────────────────────────────────────────
     logger.info(
-      `[Registration Import] Complete —` +
-        `\n  Source rows:              ${totalRows}` +
+      `[Registration Import] Window ${windowNumber} complete —` +
+        `\n  Window rows:               ${rowsInWindow}` +
         `\n  CardPaymentMethod submitted: ${cardPaymentMethods.length}, processed: ${cpmProcessed}, failed: ${cpmFailed}` +
         `\n  Order submitted:             ${orders.length}, processed: ${orderProcessed}, failed: ${orderFailed}` +
         `\n  PaymentGroup submitted:      ${paymentGroups.length}, processed: ${pgProcessed}, failed: ${pgFailed}` +
         `\n  Payment submitted:           ${payments.length}, processed: ${paymentProcessed}, failed: ${paymentFailed}`,
     );
 
+    // ── Invoke next window if more rows remain ───────────────────────────────
+    if (TEST_MODE && hasMore) {
+      logger.info(
+        "[Registration Import] TEST MODE: more rows remain, but stopping here " +
+          "— set TEST_MODE = false to process the full file.",
+      );
+    } else if (hasMore) {
+      logger.info(
+        `[Registration Import] More rows remain — invoking window ${windowNumber + 1} ` +
+          `at byte ${nextByteOffset}…`,
+      );
+      await (
+        context as unknown as {
+          invokeFlow(name: string, payload: unknown): Promise<void>;
+        }
+      ).invokeFlow("Registration Import", {
+        byteOffset: nextByteOffset,
+        headers: parsedHeaders,
+        windowNumber: windowNumber + 1,
+      });
+    } else {
+      logger.info(
+        `[Registration Import] All rows processed — import complete after ${windowNumber} window(s).`,
+      );
+    }
+
     return {
       data: {
-        totalRows,
+        windowNumber,
+        byteOffset,
+        nextByteOffset,
+        hasMore,
+        rowsInWindow,
         cardPaymentMethods: cardPaymentMethods.length,
         cardPaymentMethodsProcessed: cpmProcessed,
         cardPaymentMethodsFailed: cpmFailed,
