@@ -48,7 +48,10 @@
  * PREREQUISITES (Salesforce setup, not covered by this flow):
  *   - User.FederationIdentifier must be usable as an upsert key (Salesforce
  *     natively supports upsert-by-FederationIdentifier for User).
- *   - A Profile named "Student_Profile" (DEFAULT_PROFILE_NAME below) must exist.
+ *   - The Profile named in the "Account Login Profile Name" config var
+ *     (default "Student_Profile" — DEFAULT_PROFILE_NAME below) must exist
+ *     in this org under that exact name. Confirmed failing in the "Student_Profile"
+ *     org run on 2026-10-05 — set the config var to the real Profile Name before re-running.
  */
 
 import { flow } from "@prismatic-io/spectral";
@@ -380,6 +383,9 @@ export const accountLoginImport = flow({
     const fileId = configVars["Account Login File ID"] as string | undefined;
     const failedFolderId = configVars["Failed Records Folder ID"] as
       string | undefined;
+    const profileName =
+      (configVars["Account Login Profile Name"] as string | undefined) ||
+      DEFAULT_PROFILE_NAME;
 
     if (!fileId) throw new Error("Account Login File ID config var is empty.");
 
@@ -419,11 +425,12 @@ export const accountLoginImport = flow({
       const profileId = await resolveProfileId(
         sfInstanceUrl,
         sfToken,
-        DEFAULT_PROFILE_NAME,
+        profileName,
       );
       if (!profileId) {
         throw new Error(
-          `[Account Login Import] No Profile named "${DEFAULT_PROFILE_NAME}" was found in this org.`,
+          `[Account Login Import] No Profile named "${profileName}" was found in this org. ` +
+            `Set the correct value in the "Account Login Profile Name" config var.`,
         );
       }
 

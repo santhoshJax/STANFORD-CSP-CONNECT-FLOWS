@@ -163,14 +163,35 @@
  * ══════════════════════════════════════════════════════════════════════════
  *   - CardPaymentMethod.Status and .ProcessingMode — both required, neither
  *     in the workbook, neither had a code default. FIXED: Status="Active",
- *     ProcessingMode="External" (both guesses — see field default comments).
- *   - Payment.ProcessingMode — same field, same fix, same guess.
+ *     ProcessingMode="External". CONFIRMED by architect (2026-10-01) — both
+ *     *values* are correct, no longer a guess. BUT a second real run the
+ *     same day showed ProcessingMode is also blocked by Field-Level
+ *     Security on this org's migration permission set
+ *     (INVALID_FIELD_FOR_INSERT_UPDATE, same failure mode as the earlier
+ *     GroupPayee__c issue) — needs FLS edit access granted, same fix
+ *     pattern as before, on both CardPaymentMethod and Payment.
+ *   - Payment.Status and .ProcessingMode — Status="Processed" was already
+ *     from the workbook; ProcessingMode="External" was the same guess as
+ *     CardPaymentMethod's. Both CONFIRMED by architect (2026-10-01), same
+ *     FLS caveat as CardPaymentMethod above.
+ *   - Order.Status — REOPENED (2026-10-01): "Default to Activated" (the
+ *     architect's earlier addendum) fails outright — FAILED_ACTIVATION:
+ *     "For a new or cloned order, choose Draft. An Activated order's status
+ *     can't be edited." New Orders must be created as Draft; Activated is a
+ *     separate follow-up transition, almost certainly gated on the Order
+ *     having real line items (same root cause as the TotalAmount finding
+ *     above — this flow creates none). Defaulted to "Draft" so Orders can
+ *     actually be created; needs the architect to confirm whether Draft is
+ *     the intended final state or a later activation step is expected.
  *   - Order.TotalAmount — NOT a Field-Level Security issue like GroupPayee__c
  *     was. `describe()` shows createable=false/updateable=false — nobody can
- *     write this field via API, most likely because it's a rollup from Order
- *     Product line items. REMOVED the CC_Amt → TotalAmount mapping entirely;
- *     the value is still captured on Payment.Amount. Flag to architect: was
- *     OrderItems supposed to be created to drive this rollup?
+ *     write this field via API; it's Order's own built-in platform behavior
+ *     once OrderItem line items exist (confirmed not a visible Roll-Up
+ *     Summary field via Setup screenshot — native standard-object behavior).
+ *     REMOVED the CC_Amt → TotalAmount mapping entirely. RESOLVED
+ *     (2026-10-01): the workbook has no Order line item mapping anywhere, so
+ *     no OrderItems are created; CC_Amt stays on Payment.Amount only and
+ *     Order.TotalAmount is intentionally left blank.
  *   - Order.TA_Discount_Type__c — real source values ("65+", "MLA",
  *     "SAA onetime", "Teacher", ...) don't match any of the object's actual
  *     picklist values ("Senior 65+", "Stanford Affiliate", "SAA Member",
@@ -181,22 +202,57 @@
  *     still needs the architect (some pairs look obvious — "65+" →
  *     "Senior 65+" — others don't, e.g. "MLA").
  *
- * ⚠️  STILL UNVERIFIED / OPEN:
- *   - CC_Transaction_ID → Order.OrderReferenceNumber is marked "Conversion"
- *     in the workbook but no logic is described — passthrough as-is.
+ * ══════════════════════════════════════════════════════════════════════════
+ * ARCHITECT ANSWERS — 2026-10-06 (all four implemented):
+ * ══════════════════════════════════════════════════════════════════════════
+ *   - "Let's set the Order Start Date as the Registration_Date" — RESOLVED.
+ *     Order.EffectiveDate is now a direct map from Registration_Date, no
+ *     fallback to PoDate. This also resolves the 141,255-row blank-date
+ *     problem as a side effect: the new 2-year scope filter (below) is
+ *     keyed on the same Registration_Date field and already excludes any
+ *     row where it's blank/unparseable before mapToOrder ever sees it, so
+ *     EffectiveDate is guaranteed non-blank for every row that makes it
+ *     through.
+ *   - "Let's go ahead and add the picklist values for the discount types"
+ *     — RESOLVED (2026-10-06). 5 raw values that were just a shorter/
+ *     differently-cased form of an existing option are translated via
+ *     TA_DISCOUNT_TYPE_ALIASES, no Salesforce change needed for those:
+ *     "65+"→Senior 65+, "CSP full"→CSP Full (case only), "SAA"→SAA Member,
+ *     "STAP"/"STEP"→STAP Benefit. The other 6 (MLA, SAA onetime, Teacher,
+ *     Medical Center, Faculty, World Affairs Council) were added as new
+ *     picklist options in Salesforce and re-verified via
+ *     `sf sobject describe` — exact spelling confirmed matching — then
+ *     added to VALID_TA_DISCOUNT_TYPES below. Every Discount_Type value
+ *     seen in the source data so far now resolves to a valid option.
+ *   - "Let's do the last 2 years and the date to go off of is the
+ *     Registration_Date" — RESOLVED, implemented as TWO_YEAR_CUTOFF
+ *     (currently "2024-10-06", ~2 years back from when this was decided —
+ *     a fixed date, not dynamically computed from the run date, same
+ *     convention as Transcript Request's TWO_YEAR_CUTOFF). Confirm this
+ *     exact cutoff date is what was intended. Rows with a blank or
+ *     unparseable Registration_Date are treated as out-of-scope, not given
+ *     the benefit of the doubt — same precedent as Transcript Request.
+ *   - "Go ahead and set them all as Draft as the default values to start
+ *     and then we can rerun them as Activated" — CONFIRMS the existing
+ *     Status="Draft" default is correct. Also tells us a FUTURE flow (not
+ *     built yet) will be needed to transition these Orders from Draft to
+ *     Activated after this initial load — out of scope for this flow today.
+ *
+ * ⚠️  STILL OPEN:
  *   - Check_No → Order.Check_Number__c is typed "Number"; non-numeric
- *     values are skipped with a warning, not preserved anywhere.
- *   - Audit fields — RESOLVED: Created_By/Date/Time and Last_Modified_By/
- *     Date/Time are "Do Not Map" per this workbook and are skipped
- *     entirely. Each flow's mapping is independent — this flow does not
- *     borrow the Enrollment flow's separate audit-field override, since
- *     Registration's own workbook doesn't ask for it.
- *   - The cash/check-paid-registration gap: CardPaymentMethod and a
- *     Type="Capture" Payment are still created unconditionally for every
- *     registration, even ones proven (via Check_No values like "cash",
- *     "SNAP - C100461") to not have used a card at all.
- *   - No 2-year window scope, unlike Textbook/Transcript/Coursework flows —
- *     this flow currently imports full history back to 2008.
+ *     values are skipped with a warning. DEFERRED (2026-10-01) — architect
+ *     indicated historically all payments were by credit card, so this is
+ *     lower priority for now; revisit once the card-vs-check question
+ *     below is fully resolved.
+ *   - The cash/check-paid-registration gap — CONFIRMED real with evidence
+ *     (2026-10-01): checked the actual source file directly — rows where
+ *     Check_No is "cash" or "SNAP - ..." have CC_Card_Type, CC_Last_Four,
+ *     and CC_Amt all completely blank, not just unused. These are
+ *     genuinely non-card payments. Still creating a CardPaymentMethod and
+ *     a Type="Capture" Payment unconditionally for every registration
+ *     regardless. Question sent to architect: should Card/Capture-Payment
+ *     be skipped for these rows, with Payment.Amount coming from
+ *     Check_Amt instead of CC_Amt? Code unchanged pending their answer.
  *   - Windowed execution (new): rebuilds the ~190k-row Student email cache
  *     on every window rather than once for the whole file, since each
  *     execution is otherwise stateless. MAX_ROWS=25,000 keeps this to a few
@@ -237,17 +293,39 @@ const SF_PAYMENT = "Payment";
 // exactly one Bulk API batch per object.
 const MAX_ROWS = 25_000;
 
-const TEST_MODE = true; // when true: process one window only, then stop (no self-invoke)
-const TEST_LIMIT = 100; // additionally cap records (per object) within that one window
+// 2-year scope filter per architect (2026-10-06): "Let's do the last 2
+// years and the date to go off of is the Registration_Date" — same pattern
+// as Transcript Request's TWO_YEAR_CUTOFF (a fixed date, not dynamically
+// computed from the run date, so the migration scope stays stable across
+// re-runs). Set to ~2 years back from the date this was decided; confirm
+// with architect if a different exact cutoff was intended.
+const TWO_YEAR_CUTOFF = "2024-10-06";
 
-// Order.Status default — per architect addendum, see OPEN ITEMS above.
-const DEFAULT_ORDER_STATUS = "Activated";
+const TEST_MODE = true; // when true: process one window only, then stop (no self-invoke)
+const TEST_LIMIT = 50; // additionally cap records (per object) within that one window
+// Skips the first N mapped rows before applying TEST_LIMIT — lets a test run
+// target fresh, never-before-touched registrations instead of re-hitting
+// ones from an earlier test (some of which may now be in a locked Salesforce
+// state, e.g. Payment.Status="Canceled" records that can never be upserted
+// again). Set to 0 for normal behavior (test the first TEST_LIMIT rows).
+const TEST_SKIP = 100;
+
+// Order.Status default — REOPENED (2026-10-01). Architect's addendum said
+// "Default to Activated", but the real org rejects that: FAILED_ACTIVATION
+// — "For a new or cloned order, choose Draft. An Activated order's status
+// can't be edited." Salesforce requires every new Order to be created as
+// Draft; Activated is a separate follow-up transition, typically gated on
+// the Order actually having line items (same root cause as the TotalAmount
+// issue — this flow doesn't create any). Defaulting to "Draft" so Orders
+// can actually be created; confirm with architect whether that's the real
+// final state, or whether a later activation step is expected once/if
+// OrderItems enter scope.
+const DEFAULT_ORDER_STATUS = "Draft";
 
 // Order.TA_Discount_Type__c — real picklist values confirmed via
-// `sf sobject describe` against Stanford_UAT. Raw source Discount_Type
-// values ("65+", "MLA", "SAA onetime", "Teacher", ...) don't match any of
-// these — see OPEN ITEMS. Only an exact match is set; anything else is
-// skipped with a warning rather than sent and rejecting the whole Order.
+// `sf sobject describe` against Stanford_UAT. Only an exact match (after
+// the alias translation below) is set; anything else is skipped with a
+// warning rather than sent and rejecting the whole Order.
 const VALID_TA_DISCOUNT_TYPES = new Set([
   "Senior 65+",
   "Stanford Affiliate",
@@ -261,7 +339,36 @@ const VALID_TA_DISCOUNT_TYPES = new Set([
   "Educator",
   "Promo Code",
   "STAP Benefit",
+  // Added by architect/admin 2026-10-06, re-verified via `sf sobject
+  // describe` against Stanford_UAT — exact spelling confirmed matching:
+  "MLA",
+  "SAA onetime",
+  "Teacher",
+  "Medical Center",
+  "Faculty",
+  "World Affairs Council",
 ]);
+
+// Raw Discount_Type values that are just a shorter/differently-cased form
+// of an existing picklist option, confirmed by user (2026-10-06) — these
+// translate to the existing option rather than needing a new picklist
+// value added in Salesforce. Keyed lowercase for a case-insensitive match
+// (covers "CSP full" vs "CSP Full"); everything else still needs an exact
+// match against VALID_TA_DISCOUNT_TYPES, or gets added as a new picklist
+// value per the architect ("let's go ahead and add the picklist values").
+const TA_DISCOUNT_TYPE_ALIASES = new Map<string, string>([
+  ["65+", "Senior 65+"],
+  ["csp full", "CSP Full"],
+  ["saa", "SAA Member"],
+  ["stap", "STAP Benefit"],
+  ["step", "STAP Benefit"], // likely a typo of STAP
+]);
+
+function resolveTaDiscountType(raw: string): string | undefined {
+  const alias = TA_DISCOUNT_TYPE_ALIASES.get(raw.toLowerCase());
+  if (alias) return alias;
+  return VALID_TA_DISCOUNT_TYPES.has(raw) ? raw : undefined;
+}
 
 // ── Raw row type ──────────────────────────────────────────────────────────────
 
@@ -446,10 +553,8 @@ function mapToCardPaymentMethod(raw: RawRegistrationRow): SfRecord | null {
   // Status and ProcessingMode are both required (confirmed via `sf sobject
   // describe`) and not in the workbook at all — every CardPaymentMethod
   // upload failed with REQUIRED_FIELD_MISSING before these were added.
-  // Status picklist: Active / InActive / Canceled — "Active" assumed for a
-  // migrated card on file. ProcessingMode picklist: Salesforce / External —
-  // "External" assumed since this is a migrated historical record, not one
-  // Salesforce itself processed. Both are guesses; confirm with architect.
+  // Status="Active", ProcessingMode="External" — both CONFIRMED correct by
+  // the architect (2026-10-01).
   const record: SfRecord = {
     [EXT_ID_FIELD]: id,
     Status: "Active",
@@ -505,7 +610,7 @@ function mapToOrder(
 
   const record: SfRecord = {
     [EXT_ID_FIELD]: id,
-    Status: DEFAULT_ORDER_STATUS, // "Activated" per architect addendum
+    Status: DEFAULT_ORDER_STATUS, // "Draft" — see note above re: FAILED_ACTIVATION
   };
 
   // AccountId / BillToContactId — resolved by Salesforce during the Bulk API
@@ -533,17 +638,18 @@ function mapToOrder(
 
   // Batch_Print — Do Not Map
 
-  // TotalAmount — REMOVED. Workbook maps CC_Amt here as "Direct Map", but
-  // `sf sobject describe` shows createable=false, updateable=false on this
-  // field in the real org — not a Field-Level Security issue (that can be
-  // granted per-profile), this field structurally cannot be written via API
-  // by anyone, most likely because it's a rollup calculated from Order
-  // Product line items. Every Order upload failed with
-  // INVALID_FIELD_FOR_INSERT_UPDATE on this field before it was removed.
-  // CC_Amt is still captured on Payment.Amount, so the value isn't lost —
-  // just not duplicated onto Order. Flag to architect: was OrderItems
-  // supposed to be created to drive this rollup, or should CC_Amt go
-  // somewhere else on Order?
+  // TotalAmount — REMOVED, CONFIRMED (2026-10-01). Workbook maps CC_Amt
+  // here as "Direct Map", but `sf sobject describe` shows createable=false,
+  // updateable=false on this field in the real org — not a Field-Level
+  // Security issue (that can be granted per-profile), this is Order's
+  // built-in platform behavior: once OrderItem line items exist, Salesforce
+  // itself takes over this field and nobody can write it directly via API,
+  // even though it displays as a plain Currency field in Setup (confirmed
+  // via screenshot — not a visible Roll-Up Summary field, this behavior is
+  // native to the standard Order object). The workbook has no Order line
+  // item mapping anywhere, so no OrderItems are created here — CC_Amt stays
+  // on Payment.Amount only, and Order.TotalAmount is intentionally left
+  // blank. No longer an open item.
 
   // OrderReferenceNumber — workbook marks "Conversion" with no described logic;
   // passthrough raw value. See OPEN ITEMS.
@@ -562,8 +668,14 @@ function mapToOrder(
     if (checkNo !== undefined) {
       record.Check_Number__c = checkNo;
     } else {
+      // Also logging the CC_* fields here (not just Check_No) to answer the
+      // architect's question directly from real data: for a cash/check/SNAP
+      // row, are the credit card fields blank, or do some rows carry both a
+      // check number AND card details? See OPEN ITEMS re: card-vs-check.
       logger.warn(
-        `[Registration Import][Order] Non-numeric Check_No "${checkNoRaw}" for Registration ${id} — skipped (field type is Number)`,
+        `[Registration Import][Order] Non-numeric Check_No "${checkNoRaw}" for Registration ${id} ` +
+          `— skipped (field type is Number). CC_Card_Type="${str(raw.CC_Card_Type)}" ` +
+          `CC_Last_Four="${str(raw.CC_Last_Four)}" CC_Amt="${str(raw.CC_Amt)}"`,
       );
     }
   }
@@ -577,8 +689,9 @@ function mapToOrder(
 
   const discountType = str(raw.Discount_Type);
   if (discountType) {
-    if (VALID_TA_DISCOUNT_TYPES.has(discountType)) {
-      record.TA_Discount_Type__c = discountType;
+    const resolved = resolveTaDiscountType(discountType);
+    if (resolved) {
+      record.TA_Discount_Type__c = resolved;
     } else {
       logger.warn(
         `[Registration Import][Order] Discount_Type "${discountType}" for Registration ${id} ` +
@@ -598,13 +711,16 @@ function mapToOrder(
   const regDate = toDate(raw.Registration_Date);
   if (regDate) record.Registration_Date__c = regDate;
 
-  // Order.EffectiveDate — confirmed via `sf sobject describe` against
-  // STANFORD-DEV: this field exists and is REQUIRED. Not in the workbook at
-  // all, so this flow falls back Registration_Date → PoDate; if neither is
-  // present, the Order will fail to save (needs an architect decision on
-  // the real source, but this is strictly better than omitting it outright).
-  const effectiveDate = regDate || poDate;
-  if (effectiveDate) record.EffectiveDate = effectiveDate;
+  // Order.EffectiveDate — RESOLVED (2026-10-06): architect confirmed
+  // "Let's set the Order Start Date as the Registration_Date". Direct map,
+  // no fallback to PoDate needed — and the 141,255-blank-date problem this
+  // field had is now moot anyway, since the 2-year scope filter above
+  // (also keyed on Registration_Date, per the same architect message)
+  // already excludes any row with a blank/unparseable Registration_Date
+  // before it ever reaches this mapper. Kept as a conditional set rather
+  // than unconditional purely as a defensive guard, not because it's
+  // expected to actually be empty here.
+  if (regDate) record.EffectiveDate = regDate;
 
   // Created_By/Date/Time, Last_Modified_By/Date/Time — Do Not Map per this
   // workbook. Each flow's mapping is independent; not borrowing Enrollment's
@@ -629,8 +745,8 @@ function mapToPayment(raw: RawRegistrationRow): SfRecord | null {
     Status: "Processed", // Default value per workbook
     // ProcessingMode is required (confirmed via describe) and not in the
     // workbook — every Payment upload failed with REQUIRED_FIELD_MISSING
-    // before this was added. Same assumption as CardPaymentMethod: "External"
-    // since this is a migrated historical record. Confirm with architect.
+    // before this was added. "External" — CONFIRMED correct by the
+    // architect (2026-10-01), same as CardPaymentMethod.
     ProcessingMode: "External",
   };
 
@@ -668,6 +784,7 @@ interface WindowStreamResult {
   orders: SfRecord[];
   payments: SfRecord[];
   rowsInWindow: number;
+  filteredOut: number; // rows skipped by the 2-year Registration_Date scope filter
   hasMore: boolean;
   nextByteOffset: number;
   parsedHeaders: string[];
@@ -726,6 +843,7 @@ async function streamAndMapWindow(
     const orders: SfRecord[] = [];
     const payments: SfRecord[] = [];
     let rowsInWindow = 0;
+    let filteredOut = 0;
     let aborted = false;
     // Byte position after the last fully-processed row. Updated BEFORE the
     // maxRows check below, so when we abort, this already points to the
@@ -782,6 +900,17 @@ async function streamAndMapWindow(
         }
         rowsInWindow++;
 
+        // 2-year scope filter — per architect, Registration_Date is the
+        // field to go off of; a blank/unparseable date is treated as
+        // out-of-scope rather than given the benefit of the doubt (same
+        // precedent as Transcript Request's TWO_YEAR_CUTOFF filter).
+        const registrationDate = toDate(row.Registration_Date);
+        if (!registrationDate || registrationDate < TWO_YEAR_CUTOFF) {
+          filteredOut++;
+          lastCompletedCursor = rowEndByte;
+          return;
+        }
+
         const cpm = mapToCardPaymentMethod(row);
         if (cpm) cardPaymentMethods.push(cpm);
 
@@ -800,6 +929,7 @@ async function streamAndMapWindow(
           orders,
           payments,
           rowsInWindow,
+          filteredOut,
           hasMore: aborted,
           nextByteOffset: lastCompletedCursor,
           parsedHeaders: headers,
@@ -975,12 +1105,18 @@ export const registrationImport = flow({
     );
 
     let { cardPaymentMethods, orders, payments } = windowResult;
-    const { rowsInWindow, hasMore, nextByteOffset, parsedHeaders } =
-      windowResult;
+    const {
+      rowsInWindow,
+      filteredOut,
+      hasMore,
+      nextByteOffset,
+      parsedHeaders,
+    } = windowResult;
 
     logger.info(
       `[Registration Import] Window ${windowNumber} stream complete — ` +
-        `rows=${rowsInWindow}, hasMore=${hasMore}, nextByte=${nextByteOffset}, ` +
+        `rows=${rowsInWindow}, filteredOut(2yr scope)=${filteredOut}, ` +
+        `hasMore=${hasMore}, nextByte=${nextByteOffset}, ` +
         `cardPaymentMethods=${cardPaymentMethods.length}, orders=${orders.length}, ` +
         `payments=${payments.length}`,
     );
@@ -1006,11 +1142,14 @@ export const registrationImport = flow({
     }
 
     if (TEST_MODE) {
-      cardPaymentMethods = cardPaymentMethods.slice(0, TEST_LIMIT);
-      orders = orders.slice(0, TEST_LIMIT);
-      payments = payments.slice(0, TEST_LIMIT);
+      cardPaymentMethods = cardPaymentMethods.slice(
+        TEST_SKIP,
+        TEST_SKIP + TEST_LIMIT,
+      );
+      orders = orders.slice(TEST_SKIP, TEST_SKIP + TEST_LIMIT);
+      payments = payments.slice(TEST_SKIP, TEST_SKIP + TEST_LIMIT);
       logger.info(
-        `[Registration Import] TEST MODE: limited to first ${TEST_LIMIT} records per object, and won't invoke the next window.`,
+        `[Registration Import] TEST MODE: skipped first ${TEST_SKIP}, limited to next ${TEST_LIMIT} records per object, and won't invoke the next window.`,
       );
     }
 

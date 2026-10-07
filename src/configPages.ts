@@ -49,7 +49,8 @@ export const configPages = {
   }),
 
   "Quarter & Department Configuration": configPage({
-    tagline: "Identify the Google Sheets that contain quarter and department records",
+    tagline:
+      "Identify the Google Sheets that contain quarter and department records",
     elements: {
       "Quarter File ID": configVar({
         stableKey: "b2c3d4e5-2222-4b2c-9d3e-bbccdd002222",
@@ -285,11 +286,13 @@ export const configPages = {
         dataType: "string",
         description:
           "Google Drive file ID of the TSV that contains Alert records. " +
-          "Migrates RecordAlert records; ParentId/WhatId resolve to a PersonAccount " +
-          "via Student_ID, Associate_ID, or Instructor_ID, so Student/Associate/" +
-          "Instructor flows must run first. Course_RecID resolves to a " +
-          "CourseOffering lookup via the 'Course File ID' config var (Course " +
-          "Configuration page), so the Course flow must also run first.",
+          "Only rows with Created_Date >= 2024-10-06 (2-year window) are " +
+          "migrated. Migrates RecordAlert records; WhatId resolves to a " +
+          "PersonAccount via Student_ID, Associate_ID, or Instructor_ID, so " +
+          "Student/Associate/Instructor flows must run first. Course_RecID " +
+          "resolves to a CourseOffering lookup via the 'Course File ID' " +
+          "config var (Course Configuration page), so the Course flow must " +
+          "also run first.",
       }),
       "Account Login File ID": configVar({
         stableKey: "9e8d7c6b-5a4f-4b3c-8d2e-1f0a9b8c7d6e",
@@ -297,6 +300,15 @@ export const configPages = {
         description:
           "Google Drive file ID of the TSV that contains Account Login records. " +
           "Must run after Student Import — each row is matched to its Account via Student_ID.",
+      }),
+      "Account Login Profile Name": configVar({
+        stableKey: "2b4c6d8e-0a1f-4c3e-9b5d-7e8f0a1b2c3d",
+        dataType: "string",
+        default: "Student_Profile",
+        description:
+          "Exact Name of the Salesforce Profile assigned to every new Account Login " +
+          "User. Must match an existing Profile in this org exactly (case-sensitive) — " +
+          "the flow throws if no Profile with this Name is found.",
       }),
       "Failed Records Folder ID": configVar({
         stableKey: "e5f6a7b8-5555-4e8f-3b4c-eeff00223344",
